@@ -1,0 +1,92 @@
+# Test plan
+
+Static checks have been run and passed, except `python tests/check_config_sets.py --require-deployable`, which fails on purpose. MetaEditor compilation has been run on this source through `tests/compile_all.ps1`: all six experts, 0 errors and 0 warnings. That compile is not deployment readiness. MT5 and Strategy Tester tests below have not been run. Passing the static suite or the compiler is not a profitability result.
+
+## Static
+
+From the repository root.
+
+```text
+python tests/check_guard_safety.py
+python tests/check_config_sets.py
+python tests/check_config_sets.py --require-deployable
+powershell -NoProfile -ExecutionPolicy Bypass -File tests/compile_all.ps1
+```
+
+| Command | Expected | Failure signal |
+| --- | --- | --- |
+| `check_guard_safety.py` | Exit 0, `RESULT PASS`, and `NOTE  source-level only; this script does not run MetaEditor or MT5` | `RESULT FAIL` or any `FAIL  ` line |
+| `check_config_sets.py` | Exit 0, `RESULT PASS` | `RESULT FAIL` |
+| `check_config_sets.py --require-deployable` | Exit 1, `RESULT FAIL`, and the error names `DonchianExitPeriod=1` | Exit 0 while that input is still 1 |
+| `tests/compile_all.ps1` | Exit 0, `COMPILE SUMMARY  files=6 errors=0 warnings=0`, and `PASS` with `errors=0 warnings=0` for each expert below | Exit nonzero, any `FAIL`, or any error or warning count above 0 |
+
+Both passing commands must still print:
+
+- `UNRESOLVED_BLOCKER` for `bot4_v149_R23_rank2_MAGIC40001.set` and `DonchianExitPeriod=1`
+- `code/test pass is not deployment readiness`
+- `deployment automation must use --require-deployable` (config check)
+- `KNOWN_HISTORICAL_INVALID` for the three historical stage files `...54325...`, `...54326...`, and `...220202...`
+- `KNOWN_HISTORICAL_BOM_KEY` for `bot1_regime2.1_PRODUCTION_A_BEONLY.set` and `bot1_regime2.1_PRODUCTION_B_LIVEGATE_RR6.5.set`
+- `entry sites` counts `4`, `4`, `4`, `2`, `2` for regime 2.0, 2.1, 2.2, bot4, and test4
+
+A historical edit that is copied into V2 and then written back with `--write-manifest` must still fail. The pin is `tests/historical_baseline_sha256.json`. When git is available, a dirty `VALIDATED_LIVE_CONFIGS` tree fails the same check.
+
+## MetaEditor
+
+Run on this source. Command:
+
+```text
+powershell -NoProfile -ExecutionPolicy Bypass -File tests/compile_all.ps1
+```
+
+The script discovers `MetaEditor64.exe` and a terminal `MQL5\Include` that contains `Trade\Trade.mqh`, copies that library into the ignored `tests/build-mql5` tree, overlays the repository headers, compiles every `Experts/*.mq5` against that tree, prints per-file errors and warnings, and deletes generated `Experts/*.ex5`. It does not modify the terminal installation. Exit is nonzero on any error or warning.
+
+Recorded result, 0 errors and 0 warnings on every file:
+
+| Source | Compiler result |
+| --- | --- |
+| `Experts/bot1_regime2.0.mq5` | `Result: 0 errors, 0 warnings, 14677 ms elapsed, cpu='X64 Regular'` |
+| `Experts/bot1_regime2.1.mq5` | `Result: 0 errors, 0 warnings, 15904 ms elapsed, cpu='X64 Regular'` |
+| `Experts/bot1_regime2.2.mq5` | `Result: 0 errors, 0 warnings, 11227 ms elapsed, cpu='X64 Regular'` |
+| `Experts/bot4_TREND_FX_v1_49.mq5` | `Result: 0 errors, 0 warnings, 7154 ms elapsed, cpu='X64 Regular'` |
+| `Experts/EA_G_PortfolioGuard_MultiEA.mq5` | `Result: 0 errors, 0 warnings, 1817 ms elapsed, cpu='X64 Regular'` |
+| `Experts/test4_clean_HYBRID_v52.mq5` | `Result: 0 errors, 0 warnings, 2682 ms elapsed, cpu='X64 Regular'` |
+
+Elapsed time changes between machines. The required result is `0 errors, 0 warnings` and process exit 0. A later source edit must be compiled again. This result does not make V2 deployment ready while `DonchianExitPeriod=1` remains.
+
+Failure: any error, any warning, a missing `Result:` line, or an include path that does not resolve `BossafxGuardGate.mqh` or `PortfolioGuard.mqh`.
+
+## MT5 / Strategy Tester
+
+Not run. Use a hedging demo or the tester's hedging mode. A netting account must fail `OnInit` with `[GGATE] INIT FAILED: hedging account required`.
+
+| Test | Setup | Expected signal | Failure signal |
+| --- | --- | --- | --- |
+| bot4 illegal period | Historical or V2 bot4 set, `DonchianExitPeriod=1`, `UseDonchianExit=true` | `[BOT4] INIT FAILED: DonchianExitPeriod=1` and `INIT_FAILED`. No trades. | The EA starts, or the period is silently changed to 8, 10, or 14. |
+| Illegal stage file on this source | Historical 54325, 54326, or 220202 | `[GGATE] INIT FAILED` naming `TP2_Distance` and `INIT_FAILED` | The EA starts with TP2 less than or equal to TP1. |
+| Legal V2 stage file | V2 54326 (600 then 601), V2 54325 (900 then 1200), or V2 220202 (500 then 1200), only after the A/B plan exists | `OnInit` succeeds. Journal later shows the 20% close at the lower distance and the 70% close only after it. For 220202, a `BREAKEVEN_MOVE` / `staged_be_after_tp1` at the 500-point partial. | 70% closes first, or 220202 reaches 500 points with no `UseStagedBE` move when that input is true. |
+| BLOCK_NEW consumed | Guard running, force a non-OK veto (for example blanket cooldown) | `[GGATE-BLOCK]` on every entry path that tries to send, with `reason=` equal to the veto. No new deal. | A `PositionOpen` / buy / sell while `MEG_<symbol>_BLOCK_NEW` is 1 and the heartbeat is fresh. |
+| Fail-open | Stop the Guard, or delete `BOSSAFX_GuardHeartbeat_<symbol>` | Trading EA may open. Journal reason on the allowance path is a `FAIL_OPEN_*` string if that path logs it. This is allowed, and it must be visible. | The trading EA waits forever with no log, or it blocks on a missing key. |
+| Guard startup | Attach Guard on a hedging account and read the journal before the first tick's computed veto | `[G-MULTI]` / `VETO` shows `STARTUP` (107) and `MEG_<symbol>_BLOCK_NEW` is 1 with a fresh heartbeat. The next tick replaces it with the computed veto. Entries that see the fresh startup snapshot do not open. | `OnInit` publishes `OK`, or a stale startup heartbeat keeps blocking after Guard is gone. |
+| Full close over a partial pending | A TP partial is still working, then a full close is requested | While the partial order is live the full close returns `PENDING` and the TTL cancel runs. After the partial is gone, the full close sends only the live remainder and does not log the old partial deal as its own. | The full close returns `PENDING` forever, or it reports the partial fill as the full close's deal. |
+| TP stage isolation | TP1 pending, TP2 also eligible | TP2 does not cancel or consume TP1's slot. | TP2's result advances from TP1's pending order. |
+| Ambiguous close | A close send returns `TRADE_RETCODE_TIMEOUT` or connection | No second close in that call. Journal says the close is being observed. A retry happens only after the volume is unchanged for 30 seconds, or not at all if volume, a live order, or an out-deal shows the first send landed. | An immediate `CTrade` fallback, or two partial fills for one request. |
+| test4 restart | Complete TP1 on 54340, reload the EA | TP1 does not send again. TP2 still can. A full close deletes `T4STG_<login>_<symbol>_<identifier>` only after the position is confirmed closed. The stage table does not drop an open ticket to store a new one. | TP1 fires again after reload, or an open ticket's stage is replaced when the table is full. |
+| bot4 caps for 40001 | Same set thresholds. Compare feature-on and feature-off | `MaxOpenPyramids`, `MaxSameDirectionPyramids`, and `GlobalEquityStopPct` (4%) bind on magic 40001 when enabled, and do not bind when the input is disabled or set so the cap cannot hit. | The caps ignore 40001, or a threshold in the set was changed to force the test. |
+| Torn publish | Not easy by hand. Tester note: an odd `BOSSAFX_GuardPubSeq_<symbol>` must not block. | Entry allowed, `FAIL_OPEN_TORN_OR_MISSING` if logged. | Entry blocked solely because the sequence was odd or the two reads disagreed. |
+| Profit flatten | V2 or historical Guard set: `UseProfitTargetFlatten=true`, `ProfitTargetUsd=1000` | Protected legs close and the episode reason is `PROFIT_TARGET`. `BLOCK_NEW` stays 1 while the latch is active. | No close after protected floating P&L reaches 1000, or the reason is stamped `HARD_FLOOR` while hard flatten is false. |
+| Hard floor does not flatten | `UseFlattenOnHardFloor=false`, equity at or below `HardFloorLevel()` | `VETO` 101 and `BLOCK_NEW` 1 possible. Positions stay open. | Guard closes positions on the hard floor while the flag is false. |
+| Daily floor does not flatten | `UseFlattenOnDailyFloor=false` | Same split: veto may block, flatten does not run. | A daily-floor close while the flag is false. |
+| Basket | `UseBasketSLGuard=true`, `BasketSLMaxLossUsd=1200` | One direction closes with reason `BSK`. The other direction remains. | Both directions close, or the close is labeled `GRD`. |
+| Blanket vs directional cooldown | Close a protected position whose lifecycle net is below -5 USD | `LOSS_COOLDOWN_UNTIL` and the matching direction key move forward 360 minutes, not 120. `BLOCK_NEW` becomes 1. A second deal for the same position id does not arm again. | Arm on a scratch at or above -5, a second arm of the same position id, or a 120-minute window. |
+| Directional gate | `UseLossCooldownGate=true`, only the BUY until-key set | Sell entries are not blocked by the directional check. Buys are. `BLOCK_NEW` may still block both if the blanket veto is active. | The directional flag turns `BLOCK_NEW` off for one side. |
+| Pending close | A close that stays working | No second close for that ticket. After 30 seconds, one cancel. The slot remains until the order is gone. | Two close orders live for one position. |
+| Partial remainder | A partial fill | The next send is the unfilled remainder, not a new percentage of the leftover volume. | A fresh percent is sent and the position is over-closed. |
+| Deal comment | Any tagged close | Request comment starts with `<magic>\|<reason>` and stays within 31 characters. | A direct `PositionClose` with no reason, or the reason cut off while the magic remains. Broker storage of the comment is itself a result to record; static tests do not prove it. |
+| 54510 / 54511 volume | Live or tester deals versus `LotType=1` (`LOT_RISK`, `RiskPercent`) and versus `LOT_FIXED` (`LotSize`) | Volumes match risk sizing if 1 was loaded, or fixed sizing if the old key never bound. Record which. | Treating the BOM cleanup as proven without that comparison. |
+| Hedging | Netting account | `INIT_FAILED` and the hedging log line. | Any EA keeps running. |
+| Guard down at startup | Trading EA attached, Guard not yet ticked | Entries can fail open until the first even publish and a fresh heartbeat. | Assuming a missing Guard is a brake. |
+
+Strategy Tester A/B for 54325, 54326, and 220202 is mandatory before those V2 files are candidates for attach. Compare the historical inputs (which this source will refuse to start) against the V2 inputs on the same ticks by running the historical distances only in a build that does not reject them, or by journaling the stage manager offline. Do not describe the V2 distances as equivalent. 220202 must show the new `UseStagedBE` stop move at 500 points.
+
+Do not select a Donchian period inside the tester and copy it back without a separate confirmation of the live effective value. The blocked value stays 1 until that confirmation and a rerun.
