@@ -1,0 +1,35 @@
+# VALIDATED_LIVE_CONFIGS_V2
+
+**PENDING_REVALIDATION / NOT YET DEPLOYED.**
+
+**Bundle status: BLOCKED_PENDING_RUNTIME_CONFIRMATION.** This bundle is not deployment ready.
+
+This directory is a deployment candidate copied from `VALIDATED_LIVE_CONFIGS`. The historical directory is the live baseline and is not modified here. Nothing in this folder has been attached to a chart. Every candidate is `PENDING_REVALIDATION` because the EA source behavior has changed since those files were baselined. `bot4_v149_R23_rank2_MAGIC40001.set` is additionally blocked, and that blocker holds the whole bundle. A code/test pass is not deployment readiness. Deployment automation must use --require-deployable.
+
+`DonchianExitPeriod=1` with `UseDonchianExit=true` is an `UNRESOLVED_BLOCKER`. `1` is not a legal `ENUM_H1_EXIT_PERIOD` (`8`, `10`, `14`). Static evidence cannot choose one of those three. The candidate keeps `1`, and bot4 `OnInit` rejects the set, until the effective live value is confirmed and the backtests are rerun. This is **NOT economically validated.**
+
+## What changed
+
+| File | Change |
+| --- | --- |
+| `EA_G_PortfolioGuard_MultiEA_PRODUCTION_20261013.set` | Adds `MagicTest4_v52=54340`. Removes obsolete `MagicBot4_v50=60001` (no EA or set in this repo deploys that magic). Adds `LossCooldownMinNetLossUsd=5.0` and `LossCooldownArmOnBasketSL=true`, matching the Guard source defaults. |
+| `bot1_regime2.0_PRODUCTION_667_MAGIC54326_M5.set` | Semantic repair. Historical `ExitMode=0`: the 20% close and the 70% close both become eligible at 600 points, and the same pass runs the 20% close first, then the 70% close of the volume still open. Current OnInit rejects that file. V2: 20% at 600 points, 70% at 601 points. **NOT economically validated.** Combined A/B revalidation is required. |
+| `bot1_regime2.0_PRODUCTION_1250_MAGIC54325_M5.set` | Semantic repair. Historical `ExitMode=0`: the 70% close at 900 points completes and sets stage=2, so the 20% close at 1200 points never runs after that. Current OnInit rejects that file. V2 introduces a 20% close at 900 points and a later 70% close at 1200 points. **NOT economically validated.** Combined A/B revalidation is required. |
+| `bot1_regime2.2_PRODUCTION_2098_MAGIC220202.set` | Semantic repair. Historical `ExitMode=0` with `UseStagedBE=true`: the 70% close at 500 points completes and sets stage=2, so the 20% close at 1200 points never runs after that, and UseStagedBE does not move the stop on that path. Current OnInit rejects that file. V2 introduces a 20% close at 500 points and a later 70% close at 1200 points. Completing the 20% close newly activates the UseStagedBE move at 500. Combined A/B revalidation must include that move. **NOT economically validated.** |
+| `bot4_v149_R23_rank2_MAGIC40001.set` | `BLOCKED_PENDING_RUNTIME_CONFIRMATION`. `DonchianExitPeriod=1` is unchanged. No set threshold changed. Executable behavior changed materially for magic 40001: `MaxOpenPyramids`, `MaxSameDirectionPyramids`, and `GlobalEquityStopPct` (the 4% strategy-wide equity breaker) now apply to this magic. Feature-on/off A/B and runtime tests are mandatory for each of those three. **NOT economically validated.** |
+| `v52_R23_v1_MAGIC54340.set` | No set threshold changed. Executable behavior changed materially for magic 54340: TP1 and TP2 are one-shot per ticket, replacing repeated per-tick partials. A completed stage is restored after restart and must not re-fire. Mandatory revalidation. **NOT economically validated.** |
+| `bot1_regime2.1_PRODUCTION_A_BEONLY.set` (54510) and `bot1_regime2.1_PRODUCTION_B_LIVEGATE_RR6.5.set` (54511) | Mandatory revalidation. Embedded U+FEFF characters were removed from `LotType`. The source default is `LOT_FIXED` (0). The candidate key is `LotType=1` (`LOT_RISK`). That cleanup is a potential economic change until live deal volumes prove LotType=1 was loaded. |
+| Every other `.set` | Parameter values match the historical file, plus the candidate banner. EA source behavior has still changed, so the file stays `PENDING_REVALIDATION`. The 54340 and 40001 rows above are not in this group: their set thresholds match history, and their executable behavior changed materially. |
+
+These three stage repairs are the candidate values already written in the files. No other distance pair was selected. No Donchian period was selected.
+
+The Guard source, not this set file, decides pool membership. The candidate source puts every active production magic, including 54322, 40001, and 54340, in both the gate pool and the protected flatten pool. `MagicGuard=61998` is the Guard EA itself and is not a fleet participant. The two pools remain separate functions so a later magic can be gate-only or flatten-only; this candidate does not use that split.
+
+`manifest.json` records file, EA source, catalog magic, chart timeframe where the set states one, per-file status, bundle status, Guard membership, the candidate sha256, and the historical sha256. Chart timeframe is null for the two regime 2.1 sets and for `v52_R23_v1_MAGIC54340.set` because those files do not state it. The Guard chart itself is not stated; its `GateTimeframe` value is PERIOD_M30.
+
+## Assumptions
+
+- One `.set` per active production magic, matched by the catalog magic, the active `MagicNumber`, and a filename `MAGIC` token when the name has one.
+- `ExitMode=0` is staged point mode. `ExitMode=1` is R-multiple mode and is not part of the three distance repairs.
+- A missing input in a trading set keeps the EA source default. The Guard candidate lists every current Guard input.
+- Loading the historical Guard set onto the new source would ignore removed `MagicBot4_v50` and take `MagicTest4_v52=54340` from the source default. The V2 set makes that membership explicit.
