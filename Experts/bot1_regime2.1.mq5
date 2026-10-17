@@ -4186,22 +4186,52 @@ void ManageStagedProfits() {
                   double agePnl = position.Profit();
                   double ageEarlyPx1Bar, ageEarlyPx3Bar, ageEarlyPx5Bar;
                   Bot1GetEarlyPriceAction(ticket, ageEarlyPx1Bar, ageEarlyPx3Bar, ageEarlyPx5Bar);
-                  bool ageClosed = GGate_CloseTagged(trade, ticket, GGATE_REASON_MAN, "AgeHit");
-               uint ageRc = trade.ResultRetcode();
-               bool ageOk = ageClosed || (ageRc == TRADE_RETCODE_DONE || ageRc == TRADE_RETCODE_DONE_PARTIAL);
-               if(ageOk) {
-                     Bot1WriteTradeLog(ticket, "CLOSE", ageClosePrice, ageVolume, agePnl, 0,
-                        "MAX_TRADE_AGE_HIT", position.StopLoss(), position.TakeProfit(), 0, 0, 0,
+                  ulong ageDeal = 0;
+                  double ageFilled = 0;
+                  double ageSl = position.StopLoss(), ageTp = position.TakeProfit();
+                  int ageOutcome = GGate_CloseTaggedEx(trade, ticket, GGATE_REASON_MAN, ageDeal, ageFilled, "AgeHit");
+               uint ageRc = GGate_LastCloseRetcode();
+               if(ageOutcome == GGATE_CLOSE_PARTIAL) {
+                  // Partially closed: log the filled slice, keep the position managed;
+                  // the next age check closes only the position's remaining volume.
+                  Bot1LogCloseDeal(ticket, "CLOSE", "MAX_TRADE_AGE_HIT_partial_fill", ageClosePrice,
+                     ageFilled, ageDeal, ageSl, ageTp, mfePx, maePx, barsToMfePx, barsToMaePx);
+                  Print("[BOT1-ERROR] Max-trade-age close PARTIAL for ", _Symbol, " ticket=", ticket,
+                        " filled=", ageFilled, " of ", ageVolume, " -- remainder retried");
+                  Bot1SetCloseCooldown(ticket);
+                  continue;
+               }
+               if(ageOutcome == GGATE_CLOSE_PENDING)
+                  continue;   // close order working on the server; nothing else may close this ticket now
+               if(ageOutcome == GGATE_CLOSE_FULL) {
+                     if(Bot1PositionStillOpen(ticket)) {
+                        Bot1LogCloseDeal(ticket, "CLOSE", "MAX_TRADE_AGE_HIT_partial_fill", ageClosePrice,
+                           ageFilled, ageDeal, ageSl, ageTp, mfePx, maePx, barsToMfePx, barsToMaePx);
+                        Print("[BOT1-ERROR] Max-trade-age close left the position open for ", _Symbol,
+                              " ticket=", ticket, " -- not releasing state");
+                        Bot1SetCloseCooldown(ticket);
+                        continue;
+                     }
+                     if(ageDeal != 0 && Bot1WasDealLogged(ageDeal)) {
+                        Bot1ClaimFullCloseLogged(ticket);
+                        Bot1FinalizeClosedPosition(ticket, ageDeal, "MAX_TRADE_AGE_HIT");
+                        continue;
+                     }
+                     if(Bot1ClaimFullCloseLogged(ticket)) {
+                     if(ageDeal != 0) Bot1MarkDealLogged(ageDeal);
+                     Bot1WriteTradeLog(ticket, "CLOSE", ageClosePrice, ageFilled, agePnl, 0,
+                        "MAX_TRADE_AGE_HIT", ageSl, ageTp, 0, 0, 0,
                         mfePx, maePx, barsToMfePx, barsToMaePx, 0, -1,
                         "", -1, -1, "", -1, -1, -1, -1, -999999, -1,
                         -999999, -999999, -99, -99, -1, -999999, -99, "", -1, -1,
                         -999999, -999999, -999999,
                         ageEarlyPx1Bar, ageEarlyPx3Bar, ageEarlyPx5Bar);
-                     if(agePnl > 0) g_consecLosses = 0; else if(agePnl < 0) g_consecLosses++;
+                     }
+                     Bot1FinalizeClosedPosition(ticket, ageDeal, "MAX_TRADE_AGE_HIT");
                      continue;   // position is gone -- skip the rest of this iteration's staged-exit logic
                } else {
-                  Print("[BOT1-ERROR] Max-trade-age close REJECTED for ", _Symbol, " ticket=", ticket,
-                        " age_bars=", ageBars, " retcode=", ageRc);
+                  Print("[BOT1-ERROR] Max-trade-age close ", GGate_CloseOutcomeText(ageOutcome), " for ", _Symbol,
+                        " ticket=", ticket, " age_bars=", ageBars, " retcode=", ageRc);
                }
             }
          }
@@ -4270,21 +4300,22 @@ void ManageStagedProfits() {
          // final-close-target fix, not retried every tick.
          if(g_UseStageExits && stageHit1 && position.Volume() > 0.01
             && Bot1GetStage(ticket) < 1 && !Bot1IsOnCloseCooldown(ticket)) {
-            double volumeToClose = Bot1PartialCloseVolume(position.Volume(), stageClose1);
+            // A previous attempt that partially filled or is still pending owns the
+            // amount: send only the unfilled remainder, never a fresh percentage.
+            double volumeToClose = GGate_PartialPlanVolume(ticket, 1,
+               Bot1PartialCloseVolume(position.Volume(), stageClose1));
             if(volumeToClose >= 0.01) {
                ulong gTp1Deal = 0;
-               if(GGate_ClosePartialTagged(trade, ticket, volumeToClose, GGATE_REASON_TP1, gTp1Deal)) {
-                  Print("TP1 Hit: Closed ", volumeToClose, " at ", g_TP1_Distance, " pips");
-                  double pComm = 0, pSwap = 0, pRealized = 0;
-                  ulong pDeal = gTp1Deal;
-                  if(pDeal != 0 && HistoryDealSelect(pDeal)) {
-                     pComm = HistoryDealGetDouble(pDeal, DEAL_COMMISSION);
-                     pSwap = HistoryDealGetDouble(pDeal, DEAL_SWAP);
-                     pRealized = HistoryDealGetDouble(pDeal, DEAL_PROFIT);
-                  }
-                  Bot1MarkDealLogged(pDeal);
-                  Bot1WriteTradeLog(ticket, "TP1_PARTIAL", currentPrice, volumeToClose, pRealized, 0, "TP1_Distance_hit",
-                     position.StopLoss(), position.TakeProfit(), 0, pComm, pSwap, mfePx, maePx, barsToMfePx, barsToMaePx);
+               double gTp1Filled = 0;
+               double tp1Sl = position.StopLoss(), tp1Tp = position.TakeProfit();
+               int gTp1Outcome = GGate_ClosePartialTaggedEx(trade, ticket, volumeToClose, GGATE_REASON_TP1, gTp1Deal, gTp1Filled, "", 1);
+               bool gTp1Done = GGate_PartialPlanApply(ticket, 1, volumeToClose, gTp1Outcome, gTp1Filled);
+               if(gTp1Outcome == GGATE_CLOSE_FULL || gTp1Outcome == GGATE_CLOSE_PARTIAL)
+                  Bot1LogCloseDeal(ticket, "TP1_PARTIAL",
+                     (gTp1Outcome == GGATE_CLOSE_FULL) ? "TP1_Distance_hit" : "TP1_Distance_hit_partial_fill",
+                     currentPrice, gTp1Filled, gTp1Deal, tp1Sl, tp1Tp, mfePx, maePx, barsToMfePx, barsToMaePx);
+               if(gTp1Done) {
+                  Print("TP1 Hit: Closed ", gTp1Filled, " (planned ", volumeToClose, ") at ", g_TP1_Distance, " pips");
                   Bot1SetStage(ticket, 1);
                   // P0: ClosePartial leaves CPositionInfo volume stale/zero on
                   // this object. 1-Min OHLC can jump TP1 and TP2 on one tick
@@ -4320,9 +4351,12 @@ void ManageStagedProfits() {
                      }
                   }
                } else {
-                  Print("[BOT1-ERROR] TP1 partial close REJECTED for ", _Symbol, " ticket=", ticket,
-                        " retcode=", trade.ResultRetcode(), " -- will retry in ", BOT1_CLOSE_RETRY_COOLDOWN_SEC, "s");
+                  Print("[BOT1-ERROR] TP1 partial close ", GGate_CloseOutcomeText(gTp1Outcome), " for ", _Symbol,
+                        " ticket=", ticket, " filled=", gTp1Filled, " still_owed=",
+                        GGate_PartialPlanVolume(ticket, 1, volumeToClose), " retcode=", GGate_LastCloseRetcode(),
+                        " -- will retry in ", BOT1_CLOSE_RETRY_COOLDOWN_SEC, "s");
                   Bot1SetCloseCooldown(ticket);
+                  if(gTp1Outcome == GGATE_CLOSE_PARTIAL && !position.SelectByTicket(ticket)) continue;
                }
             }
          }
@@ -4331,27 +4365,29 @@ void ManageStagedProfits() {
          // v5.8: same one-shot fix as STAGE 1 above.
          if(g_UseStageExits && stageHit2 && position.Volume() > 0.01
             && Bot1GetStage(ticket) < 2 && !Bot1IsOnCloseCooldown(ticket)) {
-            double volumeToClose = Bot1PartialCloseVolume(position.Volume(), stageClose2);
+            double volumeToClose = GGate_PartialPlanVolume(ticket, 2,
+               Bot1PartialCloseVolume(position.Volume(), stageClose2));
             if(volumeToClose >= 0.01) {
                ulong gTp2Deal = 0;
-               if(GGate_ClosePartialTagged(trade, ticket, volumeToClose, GGATE_REASON_TP2, gTp2Deal)) {
-                  Print("TP2 Hit: Closed ", volumeToClose, " at ", g_TP2_Distance, " pips");
-                  double pComm = 0, pSwap = 0, pRealized = 0;
-                  ulong pDeal = gTp2Deal;
-                  if(pDeal != 0 && HistoryDealSelect(pDeal)) {
-                     pComm = HistoryDealGetDouble(pDeal, DEAL_COMMISSION);
-                     pSwap = HistoryDealGetDouble(pDeal, DEAL_SWAP);
-                     pRealized = HistoryDealGetDouble(pDeal, DEAL_PROFIT);
-                  }
-                  Bot1MarkDealLogged(pDeal);
-                  Bot1WriteTradeLog(ticket, "TP2_PARTIAL", currentPrice, volumeToClose, pRealized, 0, "TP2_Distance_hit",
-                     position.StopLoss(), position.TakeProfit(), 0, pComm, pSwap, mfePx, maePx, barsToMfePx, barsToMaePx);
+               double gTp2Filled = 0;
+               double tp2Sl = position.StopLoss(), tp2Tp = position.TakeProfit();
+               int gTp2Outcome = GGate_ClosePartialTaggedEx(trade, ticket, volumeToClose, GGATE_REASON_TP2, gTp2Deal, gTp2Filled, "", 2);
+               bool gTp2Done = GGate_PartialPlanApply(ticket, 2, volumeToClose, gTp2Outcome, gTp2Filled);
+               if(gTp2Outcome == GGATE_CLOSE_FULL || gTp2Outcome == GGATE_CLOSE_PARTIAL)
+                  Bot1LogCloseDeal(ticket, "TP2_PARTIAL",
+                     (gTp2Outcome == GGATE_CLOSE_FULL) ? "TP2_Distance_hit" : "TP2_Distance_hit_partial_fill",
+                     currentPrice, gTp2Filled, gTp2Deal, tp2Sl, tp2Tp, mfePx, maePx, barsToMfePx, barsToMaePx);
+               if(gTp2Done) {
+                  Print("TP2 Hit: Closed ", gTp2Filled, " (planned ", volumeToClose, ") at ", g_TP2_Distance, " pips");
                   Bot1SetStage(ticket, 2);
                   if(!position.SelectByTicket(ticket)) continue;
                } else {
-                  Print("[BOT1-ERROR] TP2 partial close REJECTED for ", _Symbol, " ticket=", ticket,
-                        " retcode=", trade.ResultRetcode(), " -- will retry in ", BOT1_CLOSE_RETRY_COOLDOWN_SEC, "s");
+                  Print("[BOT1-ERROR] TP2 partial close ", GGate_CloseOutcomeText(gTp2Outcome), " for ", _Symbol,
+                        " ticket=", ticket, " filled=", gTp2Filled, " still_owed=",
+                        GGate_PartialPlanVolume(ticket, 2, volumeToClose), " retcode=", GGate_LastCloseRetcode(),
+                        " -- will retry in ", BOT1_CLOSE_RETRY_COOLDOWN_SEC, "s");
                   Bot1SetCloseCooldown(ticket);
+                  if(gTp2Outcome == GGATE_CLOSE_PARTIAL && !position.SelectByTicket(ticket)) continue;
                }
             }
          }
@@ -4365,25 +4401,35 @@ void ManageStagedProfits() {
             && !Bot1IsOnCloseCooldown(ticket)) {
             double remainingVol = position.Volume();
             ulong gFctDeal = 0;
-            if(GGate_CloseTagged(trade, ticket, GGATE_REASON_FCT, gFctDeal)) {
-               double pComm = 0, pSwap = 0, pRealized = 0;
-               ulong pDeal = gFctDeal;
-               if(pDeal != 0 && HistoryDealSelect(pDeal)) {
-                  pComm = HistoryDealGetDouble(pDeal, DEAL_COMMISSION);
-                  pSwap = HistoryDealGetDouble(pDeal, DEAL_SWAP);
-                  pRealized = HistoryDealGetDouble(pDeal, DEAL_PROFIT);
-               }
-               Bot1MarkDealLogged(pDeal);
-               Print("Final close target hit: closed remaining ", remainingVol, " at ", TPFinal_Distance, " pips");
-               Bot1WriteTradeLog(ticket, "FINAL_CLOSE_TARGET", currentPrice, remainingVol, pRealized, 0, "TPFinal_Distance_hit",
-                  position.StopLoss(), position.TakeProfit(), 0, pComm, pSwap, mfePx, maePx, barsToMfePx, barsToMaePx);
-               Bot1ReleaseMFESlot(ticket);
-               Bot1ReleaseStageTracker(ticket);
-               Bot1RecordTradeOutcome(ticket);
-               Bot1RegisterPostmortemWatch(ticket, currentPrice, (posType == POSITION_TYPE_BUY) ? 1 : -1, "TPFinal_Distance_hit");
+            double gFctFilled = 0;
+            double fctSl = position.StopLoss(), fctTp = position.TakeProfit();
+            int gFctOutcome = GGate_CloseTaggedEx(trade, ticket, GGATE_REASON_FCT, gFctDeal, gFctFilled);
+            if(gFctOutcome == GGATE_CLOSE_PARTIAL) {
+               // Some volume closed, the position is still open: log exactly what filled,
+               // keep trackers, and the retry closes only the position's remaining volume.
+               Bot1LogCloseDeal(ticket, "FINAL_CLOSE_TARGET", "TPFinal_Distance_hit_partial_fill", currentPrice,
+                  gFctFilled, gFctDeal, fctSl, fctTp, mfePx, maePx, barsToMfePx, barsToMaePx);
+               Print("[BOT1-ERROR] Final close target PARTIAL for ", _Symbol, " ticket=", ticket,
+                     " filled=", gFctFilled, " of ", remainingVol, " -- remainder retried in ", BOT1_CLOSE_RETRY_COOLDOWN_SEC, "s");
+               Bot1SetCloseCooldown(ticket);
+            } else if(gFctOutcome == GGATE_CLOSE_FULL && Bot1PositionStillOpen(ticket)) {
+               Bot1LogCloseDeal(ticket, "FINAL_CLOSE_TARGET", "TPFinal_Distance_hit_partial_fill", currentPrice,
+                  gFctFilled, gFctDeal, fctSl, fctTp, mfePx, maePx, barsToMfePx, barsToMaePx);
+               Print("[BOT1-ERROR] Final close target left the position open for ", _Symbol,
+                     " ticket=", ticket, " -- not releasing state");
+               Bot1SetCloseCooldown(ticket);
+            } else if(gFctOutcome == GGATE_CLOSE_FULL) {
+               Print("Final close target hit: closed remaining ", gFctFilled, " at ", TPFinal_Distance, " pips");
+               if(Bot1ClaimFullCloseLogged(ticket))
+                  Bot1LogCloseDeal(ticket, "FINAL_CLOSE_TARGET", "TPFinal_Distance_hit", currentPrice,
+                     gFctFilled, gFctDeal, fctSl, fctTp, mfePx, maePx, barsToMfePx, barsToMaePx);
+               GGate_PartialPlanClear(ticket, 1);
+               GGate_PartialPlanClear(ticket, 2);
+               Bot1FinalizeClosedPosition(ticket, gFctDeal, "TPFinal_Distance_hit");
             } else {
-               Print("[BOT1-ERROR] Final close target REJECTED for ", _Symbol, " ticket=", ticket,
-                     " retcode=", trade.ResultRetcode(), " -- will retry in ", BOT1_CLOSE_RETRY_COOLDOWN_SEC, "s");
+               Print("[BOT1-ERROR] Final close target ", GGate_CloseOutcomeText(gFctOutcome), " for ", _Symbol,
+                     " ticket=", ticket, " retcode=", GGate_LastCloseRetcode(),
+                     " -- will retry in ", BOT1_CLOSE_RETRY_COOLDOWN_SEC, "s");
                Bot1SetCloseCooldown(ticket);
             }
          }
@@ -4892,6 +4938,160 @@ bool Bot1WasDealLogged(ulong dealTicket) {
    for(int i = 0; i < BOT1_DEDUPE_SLOTS; i++)
       if(g_loggedDeals[i] == dealTicket) return true;
    return false;
+}
+
+// Log one executed close deal from a GGate_*Ex outcome with its real volume and
+// realized P&L. Skips a deal that is already logged (e.g. a pending close that
+// OnTradeTransaction recorded first), so a fill is never attributed twice.
+void Bot1LogCloseDeal(ulong ticket, string eventType, string reason, double price,
+                      double filledVolume, ulong dealTicket, double slPrice, double tpPrice,
+                      double mfePx, double maePx, int barsToMfePx, int barsToMaePx) {
+   if(dealTicket != 0 && Bot1WasDealLogged(dealTicket)) return;
+   double pComm = 0, pSwap = 0, pRealized = 0;
+   if(dealTicket != 0 && HistoryDealSelect(dealTicket)) {
+      pComm = HistoryDealGetDouble(dealTicket, DEAL_COMMISSION);
+      pSwap = HistoryDealGetDouble(dealTicket, DEAL_SWAP);
+      pRealized = HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
+   }
+   Bot1MarkDealLogged(dealTicket);
+   Bot1WriteTradeLog(ticket, eventType, price, filledVolume, pRealized, 0, reason,
+      slPrice, tpPrice, 0, pComm, pSwap, mfePx, maePx, barsToMfePx, barsToMaePx);
+}
+
+ulong g_bot1FinalizedPos[];
+
+bool Bot1PositionStillOpen(const ulong positionId) {
+   if(positionId == 0) return false;
+   if(PositionSelectByTicket(positionId)) return true;
+   for(int i = PositionsTotal() - 1; i >= 0; i--) {
+      ulong t = PositionGetTicket(i);
+      if(t == 0) continue;
+      if((ulong)PositionGetInteger(POSITION_IDENTIFIER) == positionId) return true;
+   }
+   return false;
+}
+
+bool Bot1ClaimPositionFinalized(const ulong posTicket) {
+   if(posTicket == 0) return false;
+   int n = ArraySize(g_bot1FinalizedPos);
+   for(int i = 0; i < n; i++)
+      if(g_bot1FinalizedPos[i] == posTicket) return false;
+   if(n >= 256) {
+      for(int i = 0; i < n - 1; i++)
+         g_bot1FinalizedPos[i] = g_bot1FinalizedPos[i + 1];
+      g_bot1FinalizedPos[n - 1] = posTicket;
+      return true;
+   }
+   ArrayResize(g_bot1FinalizedPos, n + 1);
+   g_bot1FinalizedPos[n] = posTicket;
+   return true;
+}
+
+// Bookkeeping that used to run inside OnTradeTransaction for every OUT deal.
+// Runs only after the position identifier is gone, and only once. A partial
+// fill must not release MFE/stage/magic or update the loss streak.
+void Bot1FinalizeClosedPosition(const ulong posTicket, const ulong dealTicket, const string reasonOverride = "") {
+   if(Bot1PositionStillOpen(posTicket)) return;
+   if(!Bot1ClaimPositionFinalized(posTicket)) return;
+   ENUM_DEAL_REASON dealReason = DEAL_REASON_CLIENT;
+   double dealPrice = 0.0;
+   int origDir = 1;
+   if(dealTicket != 0 && HistoryDealSelect(dealTicket)) {
+      dealReason = (ENUM_DEAL_REASON)HistoryDealGetInteger(dealTicket, DEAL_REASON);
+      dealPrice = HistoryDealGetDouble(dealTicket, DEAL_PRICE);
+      ENUM_DEAL_TYPE dealType = (ENUM_DEAL_TYPE)HistoryDealGetInteger(dealTicket, DEAL_TYPE);
+      origDir = (dealType == DEAL_TYPE_SELL) ? 1 : -1;
+   }
+   double positionNetProfit = 0.0;
+   if(HistorySelectByPosition(posTicket)) {
+      int dealCount = HistoryDealsTotal();
+      for(int di = 0; di < dealCount; di++) {
+         ulong dTkt = HistoryDealGetTicket(di);
+         if(dTkt == 0) continue;
+         positionNetProfit += HistoryDealGetDouble(dTkt, DEAL_PROFIT)
+                             + HistoryDealGetDouble(dTkt, DEAL_COMMISSION)
+                             + HistoryDealGetDouble(dTkt, DEAL_SWAP);
+      }
+   }
+   if(positionNetProfit > 0) g_consecLosses = 0;
+   else if(positionNetProfit < 0) g_consecLosses++;
+   Bot1ReleaseMFESlot(posTicket);
+   Bot1ReleaseStageTracker(posTicket);
+   Bot1RecordTradeOutcome(posTicket);
+   Bot1ReleaseTrackedMagic(posTicket);
+   string why = (StringLen(reasonOverride) > 0) ? reasonOverride : "FINAL_CLOSE";
+   Bot1RegisterPostmortemWatch(posTicket, dealPrice, origDir, why);
+   if(dealReason == DEAL_REASON_SL)
+      Bot1RegisterCooldown(origDir);
+}
+
+ulong g_bot1FullCloseLogged[];
+
+bool Bot1FullCloseWasLogged(const ulong posTicket) {
+   if(posTicket == 0) return false;
+   for(int i = 0; i < ArraySize(g_bot1FullCloseLogged); i++)
+      if(g_bot1FullCloseLogged[i] == posTicket) return true;
+   return false;
+}
+
+// Position-level log dedupe. A full close whose deal ticket is 0 cannot be
+// deduped by the deal ring, so the position id is claimed instead.
+bool Bot1ClaimFullCloseLogged(const ulong posTicket) {
+   if(posTicket == 0) return false;
+   if(Bot1FullCloseWasLogged(posTicket)) return false;
+   int n = ArraySize(g_bot1FullCloseLogged);
+   if(n >= 256) {
+      for(int i = 0; i < n - 1; i++)
+         g_bot1FullCloseLogged[i] = g_bot1FullCloseLogged[i + 1];
+      g_bot1FullCloseLogged[n - 1] = posTicket;
+      return true;
+   }
+   ArrayResize(g_bot1FullCloseLogged, n + 1);
+   g_bot1FullCloseLogged[n] = posTicket;
+   return true;
+}
+
+bool Bot1PositionWasFinalized(const ulong posTicket) {
+   if(posTicket == 0) return false;
+   for(int i = 0; i < ArraySize(g_bot1FinalizedPos); i++)
+      if(g_bot1FinalizedPos[i] == posTicket) return true;
+   return false;
+}
+
+ulong Bot1LastExitDeal(const ulong posTicket) {
+   if(posTicket == 0 || !HistorySelectByPosition(posTicket)) return 0;
+   ulong found = 0;
+   int n = HistoryDealsTotal();
+   for(int i = 0; i < n; i++) {
+      ulong d = HistoryDealGetTicket(i);
+      if(d == 0) continue;
+      if((ulong)HistoryDealGetInteger(d, DEAL_POSITION_ID) != posTicket) continue;
+      long entry = HistoryDealGetInteger(d, DEAL_ENTRY);
+      if(entry == DEAL_ENTRY_OUT || entry == DEAL_ENTRY_OUT_BY)
+         found = d;
+   }
+   return found;
+}
+
+// Per-tick backstop for the OnTradeTransaction ordering hole: a closing deal
+// can arrive while the position is still visible, so the transaction handler
+// logs and returns without final bookkeeping, and no later transaction comes.
+// Uses history only. Does not write a trade-log row.
+void Bot1FinalizeOrphanedPositions() {
+   for(int pass = 0; pass < 2; pass++) {
+      int n = (pass == 0) ? BOT1_MFE_SLOTS : BOT1_MAGIC_TRACK_SLOTS;
+      for(int i = 0; i < n; i++) {
+         bool used = (pass == 0) ? g_mfeUsed[i] : g_trackedUsed[i];
+         if(!used) continue;
+         ulong ticket = (pass == 0) ? g_mfeTicket[i] : g_trackedTicket[i];
+         if(ticket == 0) continue;
+         if(Bot1PositionStillOpen(ticket)) continue;
+         if(Bot1PositionWasFinalized(ticket)) continue;
+         ulong deal = Bot1LastExitDeal(ticket);
+         if(deal == 0) continue;
+         Bot1FinalizeClosedPosition(ticket, deal, "");
+      }
+   }
 }
 
 // Called once per full close (both from OnTradeTransaction's broker-side
@@ -5639,6 +5839,8 @@ void Bot1CheckCounterTrendSignal() {
    // as their only real input, and OnTradeTransaction below is updated to
    // register cooldowns for BOTH magic numbers, so this check is meaningful.
    if(Bot1CooldownBlocks(signal)) return;
+   if(GGate_EntryBlocked((int)Bot1CounterTrendMagic(), "countertrend"))
+      return;
 
    if(signal == 1) {
       double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
@@ -5919,6 +6121,12 @@ void CheckForTradingSignals() {
       return;
    }
 
+   // Final pre-order gate for the trend order. Counter-trend opens are gated
+   // in Bot1CheckCounterTrendSignal. Missing or stale Guard state fail-opens.
+   // FLAT_REQ is not read.
+   if(GGate_EntryBlocked(MagicNumber, "trend"))
+      return;
+
    int posCount = 0;
    for(int i = PositionsTotal() - 1; i >= 0; i--) {
       if(position.SelectByIndex(i) && position.Symbol() == _Symbol && 
@@ -5934,7 +6142,8 @@ void CheckForTradingSignals() {
          for(int i = PositionsTotal() - 1; i >= 0; i--) {
             if(position.SelectByIndex(i) && position.Symbol() == _Symbol && 
                position.Magic() == MagicNumber && position.PositionType() == POSITION_TYPE_SELL) {
-               GGate_CloseTagged(trade, position.Ticket(), GGATE_REASON_MAN, "OppFlip");
+               ulong oppTicket = position.Ticket();
+               GGate_CloseTagged(trade, oppTicket, GGATE_REASON_MAN, "OppFlip");
             }
          }
       }
@@ -6006,7 +6215,8 @@ void CheckForTradingSignals() {
          for(int i = PositionsTotal() - 1; i >= 0; i--) {
             if(position.SelectByIndex(i) && position.Symbol() == _Symbol && 
                position.Magic() == MagicNumber && position.PositionType() == POSITION_TYPE_BUY) {
-               GGate_CloseTagged(trade, position.Ticket(), GGATE_REASON_MAN, "OppFlip");
+               ulong oppTicket = position.Ticket();
+               GGate_CloseTagged(trade, oppTicket, GGATE_REASON_MAN, "OppFlip");
             }
          }
       }
@@ -6479,6 +6689,18 @@ void DrawRightLegend() {
 //| OnInit                                                           
 //+------------------------------------------------------------------+
 int OnInit() {
+   if(!GGate_RequireHedgingAccount())
+      return INIT_FAILED;
+   string stageWhy = "";
+   if(!GGate_ValidateStageConfig(ExitMode == EXIT_STAGED, ExitMode == EXIT_RR_PARTIAL,
+                                 TP1_Distance, TP2_Distance, TP1_ClosePercent, TP2_ClosePercent,
+                                 ExitRR_Close1Pct, ExitRR_TP1R, ExitRR_TP2R,
+                                 TrailingActivation, TrailingDistance,
+                                 MaxBuyPositions, MaxSellPositions, CounterTrendMaxPositions,
+                                 stageWhy)) {
+      Print(stageWhy);
+      return INIT_FAILED;
+   }
    trade.SetExpertMagicNumber(MagicNumber);
    Bot1ResolveArch();
 
@@ -7211,8 +7433,25 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    bool isCounterTrendMagic = (g_UseCounterTrendModule && dealMagic == (long)Bot1CounterTrendMagic());
    if(!isTrendMagic && !isCounterTrendMagic) return;
    if(HistoryDealGetString(trans.deal, DEAL_SYMBOL) != _Symbol) return;
-   if((ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal, DEAL_ENTRY) != DEAL_ENTRY_OUT) return;
-   if(Bot1WasDealLogged(trans.deal)) return;  // already logged manually (TP1/TP2/final-close-target) -- prevents double-counted P&L
+   ENUM_DEAL_ENTRY dealEntry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+   if(dealEntry != DEAL_ENTRY_OUT && dealEntry != DEAL_ENTRY_OUT_BY) return;
+   ulong posIdNow = (ulong)HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
+   bool stillOpen = Bot1PositionStillOpen(posIdNow);
+   // A full close already logged under this position (including deal ticket 0)
+   // must not be written again. Bookkeeping still runs once the position is gone.
+   if(!stillOpen && Bot1FullCloseWasLogged(posIdNow)) {
+      if(trans.deal != 0) Bot1MarkDealLogged(trans.deal);
+      Bot1FinalizeClosedPosition(posIdNow, trans.deal);
+      return;
+   }
+   // A deal already logged (TP1/TP2/age/FCT, or an earlier delivery of this
+   // transaction) is not written again. Final bookkeeping still runs once
+   // the position is actually gone.
+   if(Bot1WasDealLogged(trans.deal)) {
+      if(!stillOpen)
+         Bot1FinalizeClosedPosition(posIdNow, trans.deal);
+      return;
+   }
 
    double dealVolume = HistoryDealGetDouble(trans.deal, DEAL_VOLUME);
    double dealPrice  = HistoryDealGetDouble(trans.deal, DEAL_PRICE);
@@ -7244,28 +7483,6 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    double mfePx = 0, maePx = 0;
    int barsToMfePx = 0, barsToMaePx = 0;
    Bot1GetMFEMAE(posTicket, mfePx, maePx, barsToMfePx, barsToMaePx);
-   // CONSECUTIVE LOSS TRACKER update (2026-09-19): this fires on the FINAL
-   // close of the position (SL/TP/manual/expert), same event that already
-   // triggers Bot1ReleaseMFESlot() below -- sum ALL deals tied to this
-   // position (TP1/TP2 partials + this final leg) via HistorySelectByPosition
-   // to get the true net result, not just this last deal's profit (which
-   // would misclassify a position that took partial profit then stopped out
-   // net-positive as a "loss" just because the LAST leg was a small SL hit).
-   double positionNetProfit = 0.0;
-   if(HistorySelectByPosition(posTicket)) {
-      int dealCount = HistoryDealsTotal();
-      for(int di = 0; di < dealCount; di++) {
-         ulong dTkt = HistoryDealGetTicket(di);
-         if(dTkt == 0) continue;
-         positionNetProfit += HistoryDealGetDouble(dTkt, DEAL_PROFIT)
-                             + HistoryDealGetDouble(dTkt, DEAL_COMMISSION)
-                             + HistoryDealGetDouble(dTkt, DEAL_SWAP);
-      }
-   } else {
-      positionNetProfit = dealProfit;  // fallback: at least this leg's profit
-   }
-   if(positionNetProfit > 0) g_consecLosses = 0;
-   else if(positionNetProfit < 0) g_consecLosses++;
    double earlyPx1BarClose, earlyPx3BarClose, earlyPx5BarClose;
    Bot1GetEarlyPriceAction(posTicket, earlyPx1BarClose, earlyPx3BarClose, earlyPx5BarClose);
    Bot1WriteTradeLog(posTicket, "CLOSE", dealPrice, dealVolume, dealProfit, 0, reasonStr,
@@ -7274,30 +7491,10 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
       -999999, -999999, -99, -99, -1, -999999, -99, "", -1, -1,
       -999999, -999999, -999999,
       earlyPx1BarClose, earlyPx3BarClose, earlyPx5BarClose);
-   Bot1ReleaseMFESlot(posTicket);
-   Bot1ReleaseStageTracker(posTicket);
-   Bot1RecordTradeOutcome(posTicket);
-   Bot1ReleaseTrackedMagic(posTicket);   // v2 AGILE: free this slot now that the position is fully closed
-
-   // Closing a BUY position generates a SELL deal and vice versa -- infer
-   // the original direction from the closing deal's type.
-   ENUM_DEAL_TYPE dealType = (ENUM_DEAL_TYPE)HistoryDealGetInteger(trans.deal, DEAL_TYPE);
-   int origDir = (dealType == DEAL_TYPE_SELL) ? 1 : -1;
-   Bot1RegisterPostmortemWatch(posTicket, dealPrice, origDir, reasonStr);
-
-   // 2026-09-02: block same-direction re-entry for N bars after a stop-loss
-   // hit -- see UseCooldownAfterSL comment. Deliberately NOT triggered by
-   // TP_HIT/MANUAL_OR_TRAIL/EXPERT_CLOSE -- only a genuine SL loss.
-   // v2 AGILE NOTE: g_cooldownUntilBuyBar/SellBar are process-global, not
-   // per-magic -- a trend-side SL will cool down the counter-trend module's
-   // same-direction entries too, and vice versa. Accepted as intentional
-   // for v1 of this module (both are "I was wrong about this direction on
-   // this symbol right now" signals) rather than building fully independent
-   // per-magic cooldown state; revisit if live/smoke data shows this
-   // cross-suppression is too aggressive.
-   if(dealReason == DEAL_REASON_SL) {
-      Bot1RegisterCooldown(origDir);
-   }
+   Bot1MarkDealLogged(trans.deal);
+   if(stillOpen) return;
+   Bot1ClaimFullCloseLogged(posTicket);
+   Bot1FinalizeClosedPosition(posTicket, trans.deal, reasonStr);
 }
 
 //+------------------------------------------------------------------+
@@ -7343,5 +7540,6 @@ void OnTick() {
       DrawRightLegend();
       ChartRedraw();
    }
+   Bot1FinalizeOrphanedPositions();
 }
 //+------------------------------------------------------------------+
