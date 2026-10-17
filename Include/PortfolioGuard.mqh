@@ -2,6 +2,7 @@
 #define PORTFOLIO_GUARD_MQH
 
 #include <Trade/Trade.mqh>
+#include <BossafxGuardGate.mqh>   // shared hedging check + market-deal close send
 
 //+------------------------------------------------------------------+
 //| PortfolioGuard.mqh — shared by EA-G and EA-S                     |
@@ -48,7 +49,7 @@ bool PgIsTester()
 
 bool PgIsHedging()
   {
-   return ((ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(ACCOUNT_MARGIN_MODE) == ACCOUNT_MARGIN_MODE_RETAIL_HEDGING);
+   return GGate_IsHedgingAccount();
   }
 
 string PgGvPrefix(const string symbol)
@@ -379,17 +380,13 @@ void PgKidLegend(const bool show,
 //+------------------------------------------------------------------+
 //| PgCloseMagic: closes all positions for (symbol, magic). Optional  |
 //| reasonTag (2026-10-06, additive) -- when non-empty, closes go     |
-//| through a raw OrderSend carrying a "<magic>|<reasonTag>" comment  |
-//| (same 31-char-safe format as GGate_BuildCloseComment() in         |
-//| BossafxGuardGate.mqh, reimplemented inline here rather than       |
-//| #include'd so this file stays dependency-free for callers that   |
-//| don't use the gate feature, e.g. EA_S_GoldSleeve.mq5 and the      |
-//| archived single-EA EA_G_PortfolioGuard.mq5). Omitting reasonTag   |
-//| (or passing "") preserves the exact old untagged-close behavior   |
-//| for every existing caller -- purely additive, zero behavior       |
-//| change unless a caller opts in.                                   |
+//| through GGate_CloseVolumeCore in BossafxGuardGate.mqh, which this |
+//| file includes. The comment is "<magic>|<reasonTag>" and is cut to |
+//| 31 characters by GGate_BuildCloseComment. Omitting reasonTag      |
+//| (or passing "") uses CTrade::PositionClose with no reason tag.    |
 //+------------------------------------------------------------------+
-int PgCloseMagic(const string symbol, const int magic, CTrade &trade, const string reasonTag = "")
+int PgCloseMagic(const string symbol, const int magic, CTrade &trade, const string reasonTag = "",
+                const long restoreMagic = -1)
   {
    int closed = 0;
    for(int i = PositionsTotal() - 1; i >= 0; i--)
@@ -409,66 +406,29 @@ int PgCloseMagic(const string symbol, const int magic, CTrade &trade, const stri
          continue;
         }
 
-      // Tagged close path: raw OrderSend so the reason survives as the DEAL comment (CTrade's
-      // PositionClose() has no comment parameter -- same constraint GGate_CloseTagged works around).
+      // Tagged close through the shared core: legal filling policy, reason on the
+      // DEAL comment, no resend while a close order is still working (PENDING),
+      // emergency CTrade fallback only after the tagged send is rejected.
+      // 2026-10-15 fix kept: the fallback runs under posMagic so DEAL_MAGIC stays
+      // attributable. restoreMagic is the caller's configured expert magic
+      // (MagicGuard for the Guard). The core restores exactly that value.
+      // restoreMagic < 0 leaves the trade object's magic unchanged.
+      // Only GGATE_CLOSE_FULL counts as closed; PARTIAL/PENDING leave the
+      // position for the next pass.
       long   posMagic = PositionGetInteger(POSITION_MAGIC);
-      string posSymbol = PositionGetString(POSITION_SYMBOL);
-      double volume    = PositionGetDouble(POSITION_VOLUME);
-      long   posType   = PositionGetInteger(POSITION_TYPE);
+      double volume   = PositionGetDouble(POSITION_VOLUME);
+      string tagComment = GGate_BuildCloseComment(posMagic, reasonTag);
 
-      string magicPart = IntegerToString(posMagic);
-      string tagComment = magicPart + "|" + reasonTag;
-      if(StringLen(tagComment) > 31)
-         tagComment = StringSubstr(tagComment, 0, 31); // never truncate below magic+reasonTag in practice -- GRD is short
-
-      MqlTradeRequest request;
-      MqlTradeResult  result;
-      ZeroMemory(request);
-      ZeroMemory(result);
-      request.action        = TRADE_ACTION_DEAL;
-      request.position      = ticket;
-      request.symbol        = posSymbol;
-      request.volume        = volume;
-      request.magic         = posMagic;
-      request.deviation     = 50;
-      request.type_filling  = ORDER_FILLING_IOC;
-      request.comment       = tagComment;
-      if(posType == POSITION_TYPE_BUY)
-        {
-         request.type  = ORDER_TYPE_SELL;
-         request.price = SymbolInfoDouble(posSymbol, SYMBOL_BID);
-        }
-      else
-        {
-         request.type  = ORDER_TYPE_BUY;
-         request.price = SymbolInfoDouble(posSymbol, SYMBOL_ASK);
-        }
-
-      if(OrderSend(request, result)
-         && (result.retcode == TRADE_RETCODE_DONE || result.retcode == TRADE_RETCODE_PLACED
-             || result.retcode == TRADE_RETCODE_DONE_PARTIAL))
-        {
+      ulong deal = 0, order = 0;
+      double filled = 0.0;
+      int outcome = GGate_CloseVolumeCore(trade, ticket, volume, true, tagComment, restoreMagic, deal, filled, order);
+      if(restoreMagic >= 0)
+         trade.SetExpertMagicNumber((ulong)restoreMagic);
+      if(outcome == GGATE_CLOSE_FULL)
          closed++;
-        }
-      // 2026-10-15 fix: trade.PositionClose() below previously used trade's OWN
-      // ExpertMagicNumber (e.g. Guard's MagicGuard) for the resulting close deal instead of
-      // posMagic -- so any caller gating on DEAL_MAGIC after a close that hit this fallback
-      // (e.g. EA_G_PortfolioGuard_MultiEA's loss-cooldown, which checks IsProtectedMagic(magic)
-      // before arming a cooldown) would silently see the wrong magic and skip that logic.
-      // Confirmed live 2026-10-15 via the sibling GGuardCloseDirectionTagged() bug (identical
-      // pattern, basket-SL path) -- fixed there and here together. posMagic == magic (the
-      // function's own filter parameter) in this tagged branch, so restore to `magic` after --
-      // CTrade exposes no getter for its currently-configured ExpertMagicNumber, but we already
-      // know what it should be from the caller's own filter, no need to read it back.
-      else
-        {
-         trade.SetExpertMagicNumber(posMagic);
-         bool fallbackClosed = trade.PositionClose(ticket); // fail-safe: untagged close beats no close at all
-         trade.SetExpertMagicNumber(magic);
-         if(fallbackClosed)
-            closed++;
-        }
      }
+   if(restoreMagic >= 0)
+      trade.SetExpertMagicNumber((ulong)restoreMagic);
    return closed;
   }
 
@@ -483,6 +443,10 @@ int PgCancelPendings(const string symbol, const int magic, CTrade &trade)
       if(OrderGetString(ORDER_SYMBOL) != symbol)
          continue;
       if((int)OrderGetInteger(ORDER_MAGIC) != magic)
+         continue;
+      // Never delete a working close order for an open position: that would
+      // cancel an in-flight flatten and invite a duplicate close next pass.
+      if(OrderGetInteger(ORDER_POSITION_ID) != 0 || GGate_PendingIsCloseOrder(ticket))
          continue;
       if(trade.OrderDelete(ticket))
          n++;
