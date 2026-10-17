@@ -1,15 +1,10 @@
 #property copyright "Gold Multi-EA"
 #property version   "1.00"
 #property strict
-#property description "Portfolio FTMO risk guard for the bot1 fleet (5 magics)."
-#property description "Phase 1: watches account equity + schedule/loss-cooldown rules, publishes"
-#property description "state via GlobalVariables, and can flatten the fleet ONLY on a hard/daily"
-#property description "DD-floor breach (both OFF by default -- enable after a watch-only dry run)."
-#property description "Schedule/cooldown brakes (loss-cooldown, weekend-gap, Friday) NEVER flatten --"
-#property description "they only publish a block-new-entries flag; consuming that flag on the EA side"
-#property description "is Phase 2, not yet wired (see PORTFOLIO_GUARD_PLAN_v2_20260929.md)."
-#property description "2026-10-02: fleet profit-target flatten (off) + MFE/MAE logging."
-#property description "2026-10-05: 1-per-bar PF-priority entry gate via GlobalVariable."
+#property description "Portfolio risk guard for the GOLD multi-EA fleet."
+#property description "Publishes coherent entry gates through terminal GlobalVariables."
+#property description "Supports enabled floor, profit-target, and basket flatten rules."
+#property description "Requires a hedging account; see docs for the deployed contract."
 
 #include <PortfolioGuard.mqh>   // PgCountPositions/PgCloseMagic/PgCancelPendings/PgIsTester -- PgCloseMagic
                                  // gained an additive optional reasonTag param 2026-10-06 (used here as
@@ -35,6 +30,7 @@ CPositionInfo position;
 #define MEG_VETO_GAP_BLOCK     104
 #define MEG_VETO_FRIDAY        105
 #define MEG_VETO_PROFIT_TARGET 106
+#define MEG_VETO_STARTUP       107
 
 input group "=== Protected magics (bot1_regime2.0/2.1 fleet -- KEEP/WATCH configs only) ==="
 input int    MagicSwingM5     = 54321;  // SWING_M5_v2       -- KEEP
@@ -46,8 +42,9 @@ input int    MagicR21B        = 54511;  // R21B_LIVEGATE_RR6.5 -- KEEP (declared
                                          // bug that made this display as "5451" on-chart was fixed
                                          // 2026-09-29 in bot1_regime2.1.mq5 -- POSITION_MAGIC was always
                                          // correctly 54511/54510, only the human-readable comment truncated)
-input int    MagicBot4_v49    = 40001;  // bot4_TREND_FX_v1_49 -- added to gate-priority pool 2026-10-05
-input int    MagicBot4_v50    = 60001;  // bot4_TREND_FX_v1_50 -- added to gate-priority pool 2026-10-05
+input int    MagicBot4_v49    = 40001;  // bot4_TREND_FX_v1_49 -- gate and protected flatten pools
+input int    MagicTest4_v52   = 54340;  // test4_clean_HYBRID_v52 live magic. Gate and protected pools.
+                                         // Removed MagicBot4_v50 (60001): no EA or .set in this repo deploys it.
 input int    MagicR22Pass6060 = 220001; // bot1_regime2.2 Move1-edgewiden Pass6060 -- DEMO deployment
                                          // 2026-10-09, NOT yet live-verified. Added to gate-priority +
                                          // protected pool from day one of deployment (see
@@ -89,11 +86,23 @@ input int    ServerToCetOffsetHours  = 0;     // MT5 SERVER time minus CET/CEST,
                                                // wrong by default (0), verify against your broker's stated
                                                // server-time offset before relying on this for anything.
 
-input group "=== Loss cooldown (fleet-wide, published only -- see Phase-1/2 note above) ==="
+input group "=== Loss cooldown (fleet-wide blanket brake + optional directional gate) ==="
+// UseLossCooldown publishes the blanket LOSS_COOLDOWN veto. Every non-OK veto,
+// including this one, sets BLOCK_NEW. That blanket coverage is deliberate.
+// UseLossCooldownGate (further down) is a separate directional consumer and
+// does not narrow BLOCK_NEW.
 input bool   UseLossCooldown      = true;
 input int    LossCooldownMinutes  = 120;
+input double LossCooldownMinNetLossUsd = 5.0; // Account-currency USD. Arm only when a fully
+                                               // closed protected position's lifecycle net
+                                               // (profit+swap+commission of every deal, entry
+                                               // and exit) is strictly below -this. A
+                                               // commission-only scratch above -this does not arm.
+input bool   LossCooldownArmOnBasketSL = true; // default ON: a basket-SL full close may arm once
+                                                // per fully closed losing position. OFF treats
+                                                // exact basket close orders as exempt.
 
-input group "=== Weekend/gap blackout (published only) ==="
+input group "=== Weekend/gap blackout (BLOCK_NEW veto, does not flatten) ==="
 // Detected generically as "no ticks for N hours", not a hardcoded Sunday calendar time -- broker
 // weekly-reopen instants vary by DST/session config, so a fixed clock time would be fragile. This
 // also incidentally catches any other multi-hour feed outage, which is a reasonable bonus, not a bug.
@@ -101,13 +110,13 @@ input bool   UseGapBlock          = true;
 input int    GapDetectHours       = 6;    // treat a tick gap of >= this many hours as a weekend/outage gap
 input int    GapBlockHours        = 2;    // block new entries for this long after ticks resume
 
-input group "=== Friday close backstop (published only -- redundant safety net) ==="
+input group "=== Friday close backstop (BLOCK_NEW veto, does not flatten) ==="
 // bot1_regime2.1.mq5 already has its own AvoidFriday/FridayCloseHour (confirmed live, input default
 // true/16). This is a portfolio-wide backstop in case any single EA's own flag were ever misconfigured.
 input bool   UseFridayBackstop    = true;
 input int    FridayBackstopHour   = 16;   // server time hour
 
-input group "=== Flatten behavior -- DD floors ONLY. Schedule/cooldown brakes NEVER flatten. ==="
+input group "=== Hard and daily floor flatten flags. Schedule brakes never flatten. ==="
 input bool   UseFlattenOnHardFloor  = false;  // OFF by default -- enable only after a watch-only dry run
 input bool   UseFlattenOnDailyFloor = false;  // OFF by default -- enable only after a watch-only dry run
 
@@ -222,15 +231,12 @@ double   g_dayStartBalance  = 0.0;
 datetime g_dayStamp         = 0;
 datetime g_lastTickTime     = 0;
 datetime g_lastHeart        = 0;
-int      g_protectedMagics[11];
-int      g_gateMagics[13];   // 2026-10-05: priority-gate pool -- separate from g_protectedMagics
-                             // (flatten-close blast radius) on purpose; includes 54322 + bot4's
-                             // two magics which are NOT flatten-protected. 2026-10-09: extended
-                             // both arrays by 1 for MagicR22Pass6060 (bot1_regime2.2 demo deploy).
-                             // 2026-10-11: extended both arrays by 3 more for the new WINRATE
-                             // production magics 54325/54326/54327 (1250/667/3257).
-                             // 2026-10-13: extended both arrays by 2 more for the new bot1_regime2.2
-                             // production magics 220201/220202 (CDHV_D_7794/CDHV_C_2098).
+// Dynamic on purpose: membership is the MegAddActiveMagic list in OnInit, not a
+// hand-counted capacity. The two pools stay separate so a later magic can be
+// gate-only or flatten-only via MegPoolAdd. This deployment puts every active
+// production magic in both, including 54322, 40001, and test4 54340.
+int      g_protectedMagics[];
+int      g_gateMagics[];
 
 //+------------------------------------------------------------------+
 //| Fleet-wide floating-P&L episode tracking (2026-10-02)             |
@@ -249,18 +255,18 @@ datetime g_lastFleetSnapshot  = 0;
 string   g_episodeEndReasonPending = "NATURAL";   // set just before a flatten call so the episode-end
                                                    // row that follows (same tick, open count drops to 0)
                                                    // records WHY it ended, not just that it did
+datetime g_episodeReasonBoundStart = 0;       // episode start this reason belongs to. A later episode,
+                                              // or positions still open after a profit-target latch,
+                                              // must not inherit PROFIT_TARGET.
 datetime g_lastGateBarTime  = 0;   // 2026-10-05: last GateTimeframe bar we ranked+published for
 datetime g_lastDistGateLoggedTime = 0;   // 2026-10-13: last fleet-entry time we logged (dedupe)
 
 // 2026-10-13: profit-target-flatten cooldown exception. A fleet-wide profit-target flatten
-// (MEG_VETO_PROFIT_TARGET) closes every protected position in one sweep; the AGGREGATE is
-// profitable by definition (that's the trigger), but an individual leg can still realize a small
-// loss. Per explicit user spec, that single losing leg should NOT start a loss-cooldown -- the
-// basket as a whole took profit, this isn't a real stop-out. Set true for the single OnTick()
-// call that performs this specific flatten, false otherwise; OnTradeTransaction() checks it
-// before applying any cooldown. NOT used for basket-SL (that one is loss-side on purpose, must
-// still cooldown) or broker-side SL hits (always cooldown, per user spec).
-bool g_inProfitTargetFlatten = false;
+// (MEG_VETO_PROFIT_TARGET) closes every protected position; the AGGREGATE is profitable by
+// definition (that's the trigger), but an individual leg can still realize a small loss. Per
+// explicit user spec, that single losing leg should NOT start a loss-cooldown. NOT used for
+// basket-SL (loss-side on purpose, must still cooldown) or broker-side SL hits (always
+// cooldown, per user spec). Attribution is by close order ticket -- see PtIsAttributedDeal().
 
 //+------------------------------------------------------------------+
 //| Fleet-wide same-direction basket SL tracking (2026-10-09).        |
@@ -271,6 +277,48 @@ bool g_inProfitTargetFlatten = false;
 //| MFE/MAE curve shape.                                              |
 //+------------------------------------------------------------------+
 int      g_basketSLLogHandle = INVALID_HANDLE;
+
+// Basket-SL attribution is by close ORDER ticket, same idea as g_ptOrders.
+// Broker comments are not used: a broker may drop "|BSK".
+#define MEG_BS_ORDER_TTL_SEC 86400
+ulong    g_bsOrders[];
+datetime g_bsOrderTime[];
+
+void BsRecordOrder(const ulong order)
+  {
+   if(order == 0)
+      return;
+   datetime now = TimeCurrent();
+   for(int i = ArraySize(g_bsOrders) - 1; i >= 0; i--)
+     {
+      if(g_bsOrders[i] == order)
+         return;
+      if(now - g_bsOrderTime[i] > MEG_BS_ORDER_TTL_SEC)
+        {
+         int last = ArraySize(g_bsOrders) - 1;
+         g_bsOrders[i]    = g_bsOrders[last];
+         g_bsOrderTime[i] = g_bsOrderTime[last];
+         ArrayResize(g_bsOrders, last);
+         ArrayResize(g_bsOrderTime, last);
+        }
+     }
+   int n = ArraySize(g_bsOrders);
+   ArrayResize(g_bsOrders, n + 1);
+   ArrayResize(g_bsOrderTime, n + 1);
+   g_bsOrders[n]    = order;
+   g_bsOrderTime[n] = now;
+  }
+
+bool BsIsAttributedDeal(const ulong dealTicket)
+  {
+   ulong order = (ulong)HistoryDealGetInteger(dealTicket, DEAL_ORDER);
+   if(order == 0)
+      return false;
+   for(int i = 0; i < ArraySize(g_bsOrders); i++)
+      if(g_bsOrders[i] == order)
+         return (TimeCurrent() - g_bsOrderTime[i] <= MEG_BS_ORDER_TTL_SEC);
+   return false;
+  }
 
 //+------------------------------------------------------------------+
 //| GGuardCloseDirectionTagged: closes ALL g_gateMagics positions in  |
@@ -298,72 +346,146 @@ int GGuardCloseDirectionTagged(const int &magics[], const ENUM_POSITION_TYPE dir
          if(magics[m] == posMagic) { inPool = true; break; }
       if(!inPool) continue;
 
-      string magicPart  = IntegerToString(posMagic);
-      string tagComment = magicPart + "|" + reasonTag;
-      if(StringLen(tagComment) > 31)
-         tagComment = StringSubstr(tagComment, 0, 31);
-
-      double volume  = PositionGetDouble(POSITION_VOLUME);
-      string posSymbol = PositionGetString(POSITION_SYMBOL);
-
-      MqlTradeRequest request;
-      MqlTradeResult  result;
-      ZeroMemory(request);
-      ZeroMemory(result);
-      request.action       = TRADE_ACTION_DEAL;
-      request.position     = ticket;
-      request.symbol       = posSymbol;
-      request.volume       = volume;
-      request.magic        = posMagic;
-      request.deviation    = 50;
-      request.type_filling = ORDER_FILLING_IOC;
-      request.comment      = tagComment;
-      if(dir == POSITION_TYPE_BUY)
-        {
-         request.type  = ORDER_TYPE_SELL;
-         request.price = SymbolInfoDouble(posSymbol, SYMBOL_BID);
-        }
-      else
-        {
-         request.type  = ORDER_TYPE_BUY;
-         request.price = SymbolInfoDouble(posSymbol, SYMBOL_ASK);
-        }
-
-      if(OrderSend(request, result)
-         && (result.retcode == TRADE_RETCODE_DONE || result.retcode == TRADE_RETCODE_PLACED
-             || result.retcode == TRADE_RETCODE_DONE_PARTIAL))
-         closed++;
-      // 2026-10-13 fix: the tagged OrderSend above hardcodes ORDER_FILLING_IOC, which this
-      // broker/symbol rejects with "Unsupported filling mode" (confirmed live 2026-10-12/13:
-      // 3700+ consecutive failures, zero real closes, across two separate basket-SL episodes --
-      // see MQL5/Logs/2026101[23].log). PgCloseMagic in PortfolioGuard.mqh already has this exact
-      // same IOC bug but survives it via an untagged CTrade::PositionClose() fallback -- this
-      // function never had that fallback, which is why basket-SL never actually closed anything.
-      // Apply the identical fallback: lose the "BSK" comment tag on this path, but actually close
-      // the position, which is the entire point of a stop-loss guard.
+      double volume = PositionGetDouble(POSITION_VOLUME);
+      string tagComment = GGate_BuildCloseComment(posMagic, reasonTag);
+      // Shared close core: legal filling policy, no resend while a close order is
+      // still working, emergency CTrade fallback only after the tagged send is
+      // rejected. 2026-10-13: a literal IOC policy was rejected ("Unsupported filling
+      // mode") for thousands of ticks; the policy is now derived from the symbol.
       //
-      // 2026-10-15 fix: g_trade.PositionClose() below uses g_trade's OWN ExpertMagicNumber
-      // (MagicGuard=61998, set once in OnInit) for the resulting close deal -- NOT posMagic.
-      // That meant every basket-SL close that hit this fallback path recorded DEAL_MAGIC=61998
-      // in history, not the bot's real magic (e.g. 54323). OnTradeTransaction()'s
-      // IsProtectedMagic(magic) check then silently failed (61998 is not a protected magic) and
-      // the per-direction loss-cooldown was NEVER armed for any basket-SL-flattened position that
-      // went through this fallback -- confirmed live 2026-10-15: two real basket-SL losses
-      // (54323/54324 at 02:13, 54325 at 04:56) produced zero "[G-MULTI] Loss cooldown triggered"
-      // log lines despite LossCooldownMinutes=120/UseLossCooldownGate=true being live. Fix:
-      // temporarily point g_trade at posMagic for this one close, then restore MagicGuard
-      // immediately after -- mirrors what the primary tagged OrderSend path above already does
-      // correctly via request.magic.
-      else
+      // 2026-10-15 fix kept: the CTrade fallback must run under posMagic, not
+      // MagicGuard=61998, or DEAL_MAGIC=61998 fails IsProtectedMagic() and the
+      // per-direction loss-cooldown is never armed (confirmed live 2026-10-15:
+      // 54323/54324 at 02:13, 54325 at 04:56 produced no cooldown). The core
+      // restores exactly MagicGuard afterwards. RequestMagic() is not used.
+      // The close order ticket is recorded for cooldown attribution. Comments
+      // are not consulted. Only a FULL close counts; PARTIAL/PENDING retry.
+      ulong deal = 0, order = 0;
+      double filled = 0.0;
+      int outcome = GGate_CloseVolumeCore(g_trade, ticket, volume, true, tagComment, MagicGuard, deal, filled, order);
+      BsRecordOrder(order);
+      g_trade.SetExpertMagicNumber(MagicGuard);
+      if(outcome == GGATE_CLOSE_FULL && !PositionSelectByTicket(ticket))
+         closed++;
+     }
+   g_trade.SetExpertMagicNumber(MagicGuard);
+   return closed;
+  }
+
+//+------------------------------------------------------------------+
+//| Profit-target flatten latch + deal attribution.                   |
+//| The trigger snapshots the protected positions open at that moment |
+//| (g_ptTargets). The latch stays on, and every tick closes whatever |
+//| targets remain, until all are gone -- closing winners first can   |
+//| no longer pull floating P&L under the target and leave the losing |
+//| legs open. Terminal: MEG_PT_LATCH_MAX_SEC, logged, then released  |
+//| (remaining legs keep their own SL/TP). Stall progress is logged.  |
+//|                                                                    |
+//| Attribution is by close ORDER ticket, not a flag: every order the |
+//| latch sends (tagged or CTrade fallback, including one resolved    |
+//| later from PENDING) is recorded in g_ptOrders. OnTradeTransaction |
+//| may run after OnTick returns, so it matches DEAL_ORDER against    |
+//| that set. A broker SL/TP or a bot's own close on a target has a   |
+//| different order ticket and is never exempted. Entries expire      |
+//| after MEG_PT_ORDER_TTL_SEC.                                        |
+//+------------------------------------------------------------------+
+#define MEG_PT_LATCH_MAX_SEC      3600
+#define MEG_PT_STALL_LOG_SEC      60
+#define MEG_PT_ORDER_TTL_SEC      86400
+
+bool     g_ptLatchActive   = false;
+datetime g_ptLatchStart    = 0;
+datetime g_ptLastStallLog  = 0;
+ulong    g_ptTargets[];
+ulong    g_ptOrders[];
+datetime g_ptOrderTime[];
+
+void PtRecordOrder(const ulong order)
+  {
+   if(order == 0)
+      return;
+   datetime now = TimeCurrent();
+   for(int i = ArraySize(g_ptOrders) - 1; i >= 0; i--)
+     {
+      if(g_ptOrders[i] == order)
+         return;
+      if(now - g_ptOrderTime[i] > MEG_PT_ORDER_TTL_SEC)
         {
-         g_trade.SetExpertMagicNumber(posMagic);
-         bool fallbackClosed = g_trade.PositionClose(ticket);
-         g_trade.SetExpertMagicNumber(MagicGuard);
-         if(fallbackClosed)
-            closed++;
+         int last = ArraySize(g_ptOrders) - 1;
+         g_ptOrders[i]    = g_ptOrders[last];
+         g_ptOrderTime[i] = g_ptOrderTime[last];
+         ArrayResize(g_ptOrders, last);
+         ArrayResize(g_ptOrderTime, last);
         }
      }
-   return closed;
+   int n = ArraySize(g_ptOrders);
+   ArrayResize(g_ptOrders, n + 1);
+   ArrayResize(g_ptOrderTime, n + 1);
+   g_ptOrders[n]    = order;
+   g_ptOrderTime[n] = now;
+  }
+
+bool PtIsAttributedDeal(const ulong dealTicket)
+  {
+   ulong order = (ulong)HistoryDealGetInteger(dealTicket, DEAL_ORDER);
+   if(order == 0)
+      return false;
+   for(int i = 0; i < ArraySize(g_ptOrders); i++)
+      if(g_ptOrders[i] == order)
+         return (TimeCurrent() - g_ptOrderTime[i] <= MEG_PT_ORDER_TTL_SEC);
+   return false;
+  }
+
+// Snapshot of protected positions on this symbol at trigger time.
+int PtSnapshotTargets()
+  {
+   ArrayResize(g_ptTargets, 0);
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(!IsProtectedMagic((int)PositionGetInteger(POSITION_MAGIC))) continue;
+      int n = ArraySize(g_ptTargets);
+      ArrayResize(g_ptTargets, n + 1);
+      g_ptTargets[n] = ticket;
+     }
+   return ArraySize(g_ptTargets);
+  }
+
+// One close pass over the remaining targets. Returns how many are still open
+// (including ones with a close order still working).
+int PtCloseRemainingTargets()
+  {
+   int remaining = 0;
+   for(int t = ArraySize(g_ptTargets) - 1; t >= 0; t--)
+     {
+      ulong ticket = g_ptTargets[t];
+      bool open = PositionSelectByTicket(ticket);
+      if(!open && GGate_PendingFind(ticket) < 0)
+        {
+         int last = ArraySize(g_ptTargets) - 1;
+         g_ptTargets[t] = g_ptTargets[last];
+         ArrayResize(g_ptTargets, last);
+         continue;
+        }
+      double volume = open ? PositionGetDouble(POSITION_VOLUME) : 0.0;
+      string comment = open ? GGate_BuildCloseComment(PositionGetInteger(POSITION_MAGIC), GGATE_REASON_GRD) : "";
+      ulong deal = 0, order = 0;
+      double filled = 0.0;
+      int outcome = GGate_CloseVolumeCore(g_trade, ticket, volume, true, comment, MagicGuard, deal, filled, order);
+      g_trade.SetExpertMagicNumber(MagicGuard);
+      PtRecordOrder(order);
+      if(outcome == GGATE_CLOSE_FULL && !PositionSelectByTicket(ticket) && GGate_PendingFind(ticket) < 0)
+        {
+         int last = ArraySize(g_ptTargets) - 1;
+         g_ptTargets[t] = g_ptTargets[last];
+         ArrayResize(g_ptTargets, last);
+         continue;
+        }
+      remaining++;
+     }
+   return remaining;
   }
 
 //+------------------------------------------------------------------+
@@ -396,6 +518,7 @@ string VetoText(const int veto)
       case MEG_VETO_GAP_BLOCK:      return "GAP_BLOCK -- weekend/outage tick gap, new entries paused";
       case MEG_VETO_FRIDAY:         return "FRIDAY -- Friday-close backstop window";
       case MEG_VETO_PROFIT_TARGET:  return "PROFIT_TARGET -- fleet floating P&L reached ProfitTargetUsd";
+      case MEG_VETO_STARTUP:        return "STARTUP -- Guard is initializing; new entries blocked until the first tick";
       default:                      return "UNKNOWN";
      }
   }
@@ -505,6 +628,154 @@ bool IsInLossCooldown()
    return TimeCurrent() < until;
   }
 
+// DEAL_POSITION_ID is the position identifier, not a deal ticket. On a hedging
+// account POSITION_IDENTIFIER equals the position ticket; on other modes it
+// may not. Match the identifier, never the ticket, to see if any volume remains.
+bool MegPositionIdStillOpen(const ulong positionId)
+  {
+   if(positionId == 0)
+      return false;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0)
+         continue;
+      if((ulong)PositionGetInteger(POSITION_IDENTIFIER) == positionId)
+         return true;
+     }
+   return false;
+  }
+
+// An OUT/OUT_BY deal is exempt only when its own close order was recorded.
+// A later SL on a remainder has a different order and is not exempt. Basket
+// orders are exempt only when LossCooldownArmOnBasketSL is false.
+bool MegOutDealExempt(const ulong deal)
+  {
+   long entry = HistoryDealGetInteger(deal, DEAL_ENTRY);
+   if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_OUT_BY)
+      return false;
+   if(PtIsAttributedDeal(deal))
+      return true;
+   if(!LossCooldownArmOnBasketSL && BsIsAttributedDeal(deal))
+      return true;
+   return false;
+  }
+
+// Full lifecycle net in account-currency USD: every deal's profit + swap +
+// commission, including the entry. allOutDealsExempt is true only when every
+// closing deal is an exact attributed profit-target (or policy-exempt basket)
+// order. outDeals == 0 means history is not complete yet.
+double MegPositionLifecycleNet(const ulong positionId, bool &allOutDealsExempt, int &outDeals, long &closeDealType)
+  {
+   allOutDealsExempt = false;
+   outDeals = 0;
+   closeDealType = -1;
+   double net = 0.0;
+   if(positionId == 0 || !HistorySelectByPosition(positionId))
+      return 0.0;
+   int exemptOut = 0;
+   int n = HistoryDealsTotal();
+   for(int i = 0; i < n; i++)
+     {
+      ulong deal = HistoryDealGetTicket(i);
+      if(deal == 0)
+         continue;
+      if((ulong)HistoryDealGetInteger(deal, DEAL_POSITION_ID) != positionId)
+         continue;
+      net += HistoryDealGetDouble(deal, DEAL_PROFIT)
+           + HistoryDealGetDouble(deal, DEAL_SWAP)
+           + HistoryDealGetDouble(deal, DEAL_COMMISSION);
+      long entry = HistoryDealGetInteger(deal, DEAL_ENTRY);
+      if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_OUT_BY)
+         continue;
+      outDeals++;
+      closeDealType = HistoryDealGetInteger(deal, DEAL_TYPE);
+      if(MegOutDealExempt(deal))
+         exemptOut++;
+     }
+   allOutDealsExempt = (outDeals > 0 && exemptOut == outDeals);
+   return net;
+  }
+
+// Bounded terminal marker, one slot ring per account login. The value is the
+// position identifier; the paired _NET variable is the lifecycle net in USD.
+// A restart that sees the same identifier again does not arm a second time.
+#define MEG_CD_MARK_SLOTS 128
+
+string MegCdMarkName(const int slot)
+  {
+   return "MEG_CDMARK_" + IntegerToString((long)AccountInfoInteger(ACCOUNT_LOGIN)) + "_" + IntegerToString(slot);
+  }
+
+string MegCdMarkIdxName()
+  {
+   return "MEG_CDMARK_IDX_" + IntegerToString((long)AccountInfoInteger(ACCOUNT_LOGIN));
+  }
+
+bool MegCooldownMarked(const ulong positionId)
+  {
+   if(positionId == 0)
+      return false;
+   for(int i = 0; i < MEG_CD_MARK_SLOTS; i++)
+     {
+      string name = MegCdMarkName(i);
+      if(!GlobalVariableCheck(name))
+         continue;
+      if((ulong)GlobalVariableGet(name) == positionId)
+         return true;
+     }
+   return false;
+  }
+
+void MegCooldownMark(const ulong positionId, const double netUsd)
+  {
+   if(positionId == 0)
+      return;
+   string idxName = MegCdMarkIdxName();
+   int idx = GlobalVariableCheck(idxName) ? (int)GlobalVariableGet(idxName) : 0;
+   if(idx < 0)
+      idx = 0;
+   int slot = idx % MEG_CD_MARK_SLOTS;
+   GlobalVariableSet(MegCdMarkName(slot), (double)positionId);
+   GlobalVariableSet(MegCdMarkName(slot) + "_NET", netUsd);
+   GlobalVariableSet(idxName, (double)(slot + 1));
+  }
+
+// Closing deals are only queued here. The position may still be open when
+// the transaction arrives, so the final deal can be missing from history.
+// MegProcessCooldownQueue evaluates an id only after no open position has
+// that POSITION_IDENTIFIER.
+#define MEG_CD_QUEUE_MAX 256
+ulong g_cdQueue[];
+
+void MegCooldownEnqueue(const ulong positionId)
+  {
+   if(positionId == 0 || MegCooldownMarked(positionId))
+      return;
+   int n = ArraySize(g_cdQueue);
+   for(int i = 0; i < n; i++)
+      if(g_cdQueue[i] == positionId)
+         return;
+   if(n >= MEG_CD_QUEUE_MAX)
+     {
+      for(int i = 0; i < n - 1; i++)
+         g_cdQueue[i] = g_cdQueue[i + 1];
+      g_cdQueue[n - 1] = positionId;
+      return;
+     }
+   ArrayResize(g_cdQueue, n + 1);
+   g_cdQueue[n] = positionId;
+  }
+
+void MegCooldownDequeueAt(const int idx)
+  {
+   int last = ArraySize(g_cdQueue) - 1;
+   if(idx < 0 || idx > last)
+      return;
+   g_cdQueue[idx] = g_cdQueue[last];
+   ArrayResize(g_cdQueue, last);
+  }
+
 void OnTradeTransaction(const MqlTradeTransaction &trans,
                          const MqlTradeRequest &request,
                          const MqlTradeResult &result)
@@ -521,44 +792,58 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
       return;
    long entry = HistoryDealGetInteger(deal_ticket, DEAL_ENTRY);
    if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_OUT_BY)
-      return;   // only closing deals (full close, partial close, or opposite-close) realize P&L
+      return;
+   ulong positionId = (ulong)HistoryDealGetInteger(deal_ticket, DEAL_POSITION_ID);
+   MegCooldownEnqueue(positionId);
+  }
 
-   double profit = HistoryDealGetDouble(deal_ticket, DEAL_PROFIT)
-                  + HistoryDealGetDouble(deal_ticket, DEAL_SWAP)
-                  + HistoryDealGetDouble(deal_ticket, DEAL_COMMISSION);
-
-   if(profit <= 0)
+void MegProcessCooldownQueue()
+  {
+   for(int i = ArraySize(g_cdQueue) - 1; i >= 0; i--)
      {
-      // 2026-10-13: profit-target-flatten exception, per explicit user spec -- a losing LEG that
-      // closes as part of a fleet-wide profit-target flatten (the aggregate IS profitable, that's
-      // the trigger) does NOT start a loss-cooldown. Basket-SL flattens and ordinary broker-side
-      // SL hits are NOT exempted -- g_inProfitTargetFlatten is only ever true during the specific
-      // PgCloseMagic() loop inside MaybeFlatten()'s MEG_VETO_PROFIT_TARGET branch (see there).
-      if(g_inProfitTargetFlatten)
+      ulong positionId = g_cdQueue[i];
+      if(MegPositionIdStillOpen(positionId))
+         continue;
+      if(MegCooldownMarked(positionId))
         {
-         if(LogFlatten)
-            Print("[G-MULTI] Loss cooldown SKIPPED -- magic=", magic, " deal_profit_total=",
-                  DoubleToString(profit, 2), " -- leg closed during a profit-target flatten (basket net positive)");
-         return;
+         MegCooldownDequeueAt(i);
+         continue;
         }
-
+      bool allExempt = false;
+      int outDeals = 0;
+      long closeType = -1;
+      double net = MegPositionLifecycleNet(positionId, allExempt, outDeals, closeType);
+      if(outDeals <= 0)
+         continue;
+      MegCooldownDequeueAt(i);
+      MegCooldownMark(positionId, net);
+      if(!UseLossCooldown)
+         continue;
+      string dirName = (closeType == DEAL_TYPE_SELL) ? "BUY" : "SELL";
+      if(allExempt)
+        {
+         Print("[G-MULTI] Loss cooldown SKIPPED -- position_id=", positionId,
+               " lifecycle_net_usd=", DoubleToString(net, 2),
+               " -- every closing deal is an exact attributed exempt order");
+         continue;
+        }
+      if(net >= -LossCooldownMinNetLossUsd)
+        {
+         Print("[G-MULTI] Loss cooldown SKIPPED -- position_id=", positionId,
+               " lifecycle_net_usd=", DoubleToString(net, 2),
+               " threshold_usd=", DoubleToString(LossCooldownMinNetLossUsd, 2),
+               " -- not below -threshold");
+         continue;
+        }
       datetime until = TimeCurrent() + LossCooldownMinutes * 60;
       MegGvSet("LOSS_COOLDOWN_UNTIL", (double)until);
-
-      // 2026-10-13: per-direction cooldown (additive, alongside the existing blanket one above
-      // which Guard's own ComputeVeto()/VetoText() status display still uses unchanged). A
-      // closing DEAL_TYPE is the OPPOSITE of the position that was closed (a closed BUY position
-      // closes via a SELL deal) -- invert it to get which direction just took the loss, so only
-      // THAT direction is blocked, not the whole fleet (narrower than the original blanket design,
-      // precisely to avoid blocking a fresh opposite-direction signal after one side gets stopped).
-      long dealType = HistoryDealGetInteger(deal_ticket, DEAL_TYPE);
-      string dirKey = (dealType == DEAL_TYPE_SELL) ? "LOSS_COOLDOWN_UNTIL_BUY" : "LOSS_COOLDOWN_UNTIL_SELL";
+      string dirKey = (closeType == DEAL_TYPE_SELL) ? "LOSS_COOLDOWN_UNTIL_BUY" : "LOSS_COOLDOWN_UNTIL_SELL";
       MegGvSet(dirKey, (double)until);
-
-      if(LogFlatten)
-         Print("[G-MULTI] Loss cooldown triggered -- magic=", magic, " deal_profit_total=",
-               DoubleToString(profit, 2), " direction_blocked=", (dirKey == "LOSS_COOLDOWN_UNTIL_BUY" ? "BUY" : "SELL"),
-               " -- new entries blocked (that direction) until ", TimeToString(until));
+      Print("[G-MULTI] Loss cooldown ARMED -- position_id=", positionId,
+            " lifecycle_net_usd=", DoubleToString(net, 2),
+            " threshold_usd=", DoubleToString(LossCooldownMinNetLossUsd, 2),
+            " direction_blocked=", dirName,
+            " until ", TimeToString(until));
      }
   }
 
@@ -650,9 +935,12 @@ void UpdateFleetEpisode()
      {
       if(openNow > 0)
         {
-         // New episode starts.
+         // New episode starts. A reason stamped for a previous episode must not
+         // label this one (a leftover PROFIT_TARGET in particular).
          g_episodeActive     = true;
          g_episodeStart       = TimeCurrent();
+         g_episodeEndReasonPending = "NATURAL";
+         g_episodeReasonBoundStart = 0;
          g_episodePeak        = floatingNow;
          g_episodePeakTime    = TimeCurrent();
          g_episodeTrough      = floatingNow;
@@ -689,8 +977,12 @@ void UpdateFleetEpisode()
       // Episode ends naturally (all protected positions closed, whatever the reason --
       // own TP/SL, a DD-floor flatten, or the new profit-target flatten; end_reason is
       // passed in by the caller that detected the trigger, "NATURAL" otherwise).
-      FleetLogRow("EPISODE_END", g_episodeEndReasonPending);
+      string endReason = "NATURAL";
+      if(g_episodeReasonBoundStart == g_episodeStart)
+         endReason = g_episodeEndReasonPending;
+      FleetLogRow("EPISODE_END", endReason);
       g_episodeEndReasonPending = "NATURAL";
+      g_episodeReasonBoundStart = 0;
       g_episodeActive = false;
      }
   }
@@ -826,23 +1118,36 @@ void UpdateBasketSL()
      }
   }
 
+bool EquityAtOrBelowHardFloor()
+  {
+   return (AccountInfoDouble(ACCOUNT_EQUITY) <= HardFloorLevel());
+  }
+
+bool EquityAtOrBelowDailyFloor()
+  {
+   return (g_dayStartBalance > 0.0 && AccountInfoDouble(ACCOUNT_EQUITY) <= DailySoftFloorLevel());
+  }
+
+bool FleetProfitTargetReached()
+  {
+   int openNow = 0;
+   double floatingNow = FleetFloatingTotal(openNow);
+   return (openNow > 0 && floatingNow >= ProfitTargetUsd);
+  }
+
+// Status veto only. Precedence is unchanged (worse brakes win) and is what
+// Publish() writes to VETO / BLOCK_NEW. Flatten execution does not use this
+// value: a disabled hard/daily floor must not mask an enabled profit target.
 int ComputeVeto()
   {
-   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-
-   if(equity <= HardFloorLevel())
+   if(EquityAtOrBelowHardFloor())
       return MEG_VETO_HARD_FLOOR;
 
-   if(g_dayStartBalance > 0 && equity <= DailySoftFloorLevel())
+   if(EquityAtOrBelowDailyFloor())
       return MEG_VETO_DAILY_FLOOR;
 
-   if(UseProfitTargetFlatten)
-     {
-      int openNow = 0;
-      double floatingNow = FleetFloatingTotal(openNow);
-      if(openNow > 0 && floatingNow >= ProfitTargetUsd)
-         return MEG_VETO_PROFIT_TARGET;
-     }
+   if(g_ptLatchActive || (UseProfitTargetFlatten && FleetProfitTargetReached()))
+      return MEG_VETO_PROFIT_TARGET;
 
    if(IsInLossCooldown())
       return MEG_VETO_LOSS_COOLDOWN;
@@ -861,26 +1166,42 @@ int ComputeVeto()
    return MEG_VETO_OK;
   }
 
-bool ShouldFlatten(const int veto)
+// Highest-precedence ENABLED flatten that is currently true, or MEG_VETO_OK.
+// Hard, then daily, then profit. Each flag is required, so a disabled floor
+// falls through instead of swallowing a later enabled flatten. An active
+// profit-target latch keeps returning PROFIT_TARGET even after floating P&L
+// drops back under the target, until every snapshotted leg is closed.
+int ComputeFlattenReason()
   {
-   if(veto == MEG_VETO_HARD_FLOOR  && UseFlattenOnHardFloor)  return true;
-   if(veto == MEG_VETO_DAILY_FLOOR && UseFlattenOnDailyFloor) return true;
-   if(veto == MEG_VETO_PROFIT_TARGET && UseProfitTargetFlatten) return true;
-   return false;   // schedule/cooldown brakes (loss-cooldown, gap, Friday) NEVER flatten by design --
-                    // they only ever publish a block-new-entries flag, per the confirmed spec.
+   if(UseFlattenOnHardFloor && EquityAtOrBelowHardFloor())
+      return MEG_VETO_HARD_FLOOR;
+   if(UseFlattenOnDailyFloor && EquityAtOrBelowDailyFloor())
+      return MEG_VETO_DAILY_FLOOR;
+   if(g_ptLatchActive)
+      return MEG_VETO_PROFIT_TARGET;
+   if(UseProfitTargetFlatten && FleetProfitTargetReached())
+      return MEG_VETO_PROFIT_TARGET;
+   return MEG_VETO_OK;
   }
 
 //+------------------------------------------------------------------+
 int g_lastLoggedVeto = -1;   // -1 = never logged yet; forces one log line on first tick
 
-void Publish(const int veto)
+void Publish(const int veto, const int flattenReason)
   {
+   // BLOCK_NEW covers every non-OK veto (loss cooldown, gap, Friday, floors,
+   // profit target). That blanket is deliberate. UseLossCooldown controls
+   // whether the cooldown veto is computed; it does not narrow BLOCK_NEW.
+   // Odd sequence, then the variables, then even sequence and the heartbeat
+   // of this completed publication.
+   GGate_PublishBegin();
    MegGvSet("VETO",       (double)veto);
    MegGvSet("BLOCK_NEW",  (veto != MEG_VETO_OK) ? 1.0 : 0.0);
-   MegGvSet("FLAT_REQ",   ShouldFlatten(veto) ? 1.0 : 0.0);
+   MegGvSet("FLAT_REQ",   (flattenReason != MEG_VETO_OK) ? 1.0 : 0.0);
    MegGvSet("HARD_FLOOR", HardFloorLevel());
    MegGvSet("DAILY_FLOOR",DailySoftFloorLevel());
    MegGvSet("TS",         (double)TimeCurrent());
+   GGate_PublishEnd();
    // 2026-09-29 bugfix: log only on a STATE TRANSITION, not every tick while a brake stays active.
    // Original unconditional "veto != MEG_VETO_OK" print produced 52,901 lines over ~9h of
    // intermittent cooldown in the BOSSAFX-Demo dry run -- found during first validation pass.
@@ -893,36 +1214,121 @@ void Publish(const int veto)
      }
   }
 
-void MaybeFlatten(const int veto)
+void MaybeFlatten(const int flattenReason)
   {
-   if(!ShouldFlatten(veto))
+   if(flattenReason == MEG_VETO_OK)
       return;
-   g_episodeEndReasonPending = VetoText(veto);   // so the EPISODE_END row that follows (open count
-                                                  // drops to 0 on this same tick, caught by
-                                                  // UpdateFleetEpisode()) records WHY, not just that
-   // 2026-10-13: bracket the profit-target flatten so OnTradeTransaction() (fired synchronously by
-   // each PgCloseMagic()->OrderSend() call below, before it returns) can tell "this losing leg
-   // closed as part of a profitable fleet-wide profit-target sweep" apart from "this is a genuine
-   // standalone stop-out" -- only the former skips loss-cooldown. Hard/daily-floor flattens are
-   // NOT profit-target, so they're excluded here on purpose (a floor breach losing badly should
-   // still cooldown like any other loss).
-   bool isProfitTargetFlatten = (veto == MEG_VETO_PROFIT_TARGET);
-   if(isProfitTargetFlatten)
-      g_inProfitTargetFlatten = true;
+   // One close pass for every enabled flatten that is true this tick. The
+   // reason is the highest-precedence enabled trigger, so a disabled hard or
+   // daily floor cannot stamp HARD_FLOOR/DAILY_FLOOR over an actual profit
+   // flatten, and we do not run the close loop once per reason.
+   // Profit-target stamps its own reason inside the latch, and only for the
+   // episode that is active when the latch starts.
+   if(flattenReason == MEG_VETO_PROFIT_TARGET)
+     {
+      MaybeFlattenProfitTarget();
+      return;
+     }
 
+   // Episode end reason is recorded only while an episode is active, so a
+   // floor breach with nothing open cannot poison the next episode.
+   if(g_episodeActive)
+     {
+      g_episodeEndReasonPending = VetoText(flattenReason);
+      g_episodeReasonBoundStart = g_episodeStart;
+     }
+
+   // Hard/daily floor: not profit-target, so no loss-cooldown exemption (a floor breach
+   // losing badly should still cooldown like any other loss). If a profit-target latch
+   // was active its targets are closed here too; the latch clears itself once they are gone.
    int total = 0;
    for(int i = 0; i < ArraySize(g_protectedMagics); i++)
      {
-      total += PgCloseMagic(_Symbol, g_protectedMagics[i], g_trade, "GRD");
+      total += PgCloseMagic(_Symbol, g_protectedMagics[i], g_trade, "GRD", MagicGuard);
       total += PgCancelPendings(_Symbol, g_protectedMagics[i], g_trade);
      }
-
-   if(isProfitTargetFlatten)
-      g_inProfitTargetFlatten = false;
+   g_trade.SetExpertMagicNumber(MagicGuard);
 
    if(LogFlatten)
-      Print("[G-MULTI] FLATTEN executed -- veto=", VetoText(veto), " closed/cancelled=", total,
+      Print("[G-MULTI] FLATTEN executed -- reason=", VetoText(flattenReason), " closed/cancelled=", total,
             " across ", ArraySize(g_protectedMagics), " protected magics");
+  }
+
+void MaybeFlattenProfitTarget()
+  {
+   datetime now = TimeCurrent();
+   if(!g_ptLatchActive)
+     {
+      int n = PtSnapshotTargets();
+      if(n == 0)
+         return;
+      g_ptLatchActive  = true;
+      g_ptLatchStart   = now;
+      g_ptLastStallLog = now;
+      if(g_episodeActive)
+        {
+         g_episodeEndReasonPending = VetoText(MEG_VETO_PROFIT_TARGET);
+         g_episodeReasonBoundStart = g_episodeStart;
+        }
+      if(LogFlatten)
+         Print("[G-MULTI] PROFIT_TARGET latch ON -- targets=", n,
+               " (closing every snapshotted leg even if floating P&L falls back under target)");
+     }
+
+   // The episode may be opened later in this same OnTick (UpdateFleetEpisode
+   // runs after the flatten). Bind the reason once that episode exists, and
+   // only to that start time, so a later episode cannot inherit it.
+   if(g_ptLatchActive && g_episodeActive && g_episodeReasonBoundStart != g_episodeStart)
+     {
+      g_episodeEndReasonPending = VetoText(MEG_VETO_PROFIT_TARGET);
+      g_episodeReasonBoundStart = g_episodeStart;
+     }
+
+   int remaining = PtCloseRemainingTargets();
+   int cancelled = 0;
+   for(int i = 0; i < ArraySize(g_protectedMagics); i++)
+      cancelled += PgCancelPendings(_Symbol, g_protectedMagics[i], g_trade);
+
+   if(remaining == 0)
+     {
+      g_ptLatchActive = false;
+      ArrayResize(g_ptTargets, 0);
+      int stillOpen = 0;
+      FleetFloatingTotal(stillOpen);
+      if(stillOpen > 0)
+        {
+         // Targeted legs are gone, but other protected positions are still
+         // open. Those are not this flatten; do not leave PROFIT_TARGET on them.
+         g_episodeEndReasonPending = "NATURAL";
+         g_episodeReasonBoundStart = 0;
+         if(LogFlatten)
+            Print("[G-MULTI] PROFIT_TARGET latch OFF -- targets closed, ", stillOpen,
+                  " unrelated protected position(s) still open; episode end reason cleared");
+        }
+      else if(LogFlatten)
+         Print("[G-MULTI] PROFIT_TARGET latch OFF -- all targeted legs closed after ",
+               (int)(now - g_ptLatchStart), "s; pendings cancelled=", cancelled);
+      return;
+     }
+
+   if(now - g_ptLatchStart >= MEG_PT_LATCH_MAX_SEC)
+     {
+      Print("[G-MULTI] PROFIT_TARGET latch ABANDONED (terminal) -- ", remaining,
+            " targeted leg(s) still open after ", MEG_PT_LATCH_MAX_SEC,
+            "s of retries; they keep their own SL/TP. Close manually if required.");
+      g_ptLatchActive = false;
+      ArrayResize(g_ptTargets, 0);
+      g_episodeEndReasonPending = "NATURAL"; // remaining legs will end the episode on their own
+      g_episodeReasonBoundStart = 0;
+      return;
+     }
+
+   if(LogFlatten && now - g_ptLastStallLog >= MEG_PT_STALL_LOG_SEC)
+     {
+      g_ptLastStallLog = now;
+      Print("[G-MULTI] PROFIT_TARGET latch RETRY -- ", remaining, " targeted leg(s) still open after ",
+            (int)(now - g_ptLatchStart), "s (working close orders are not resent)");
+     }
   }
 
 //+------------------------------------------------------------------+
@@ -997,7 +1403,7 @@ void DrawLegend(const int veto)
 
    int y = 14;
    int lh = 14;   // line height
-   MegLabel("title", 10, y, "=== PORTFOLIO GUARD (Phase 1) ===", clrWhite, 10); y += lh + 2;
+   MegLabel("title", 10, y, "=== PORTFOLIO GUARD ===", clrWhite, 10); y += lh + 2;
    MegLabel("acct", 10, y, StringFormat("Equity $%.2f  Balance $%.2f", equity, balance), clrSilver); y += lh;
    MegLabel("floors", 10, y, StringFormat("HardFloor $%.2f   DailyFloor $%.2f", HardFloorLevel(), DailySoftFloorLevel()), clrSilver); y += lh;
    MegLabel("veto", 10, y, "BRAKE: " + VetoText(veto), vetoColor, 10); y += lh + 2;
@@ -1045,62 +1451,116 @@ void RemoveLegendObjects()
   }
 
 //+------------------------------------------------------------------+
+//| One pool slot. Duplicate or non-positive magic fails OnInit.      |
+//| Gate-only or flatten-only membership is a direct MegPoolAdd call. |
+//+------------------------------------------------------------------+
+void MegPoolAdd(int &pool[], const int magic, const string poolName)
+  {
+   if(magic <= 0)
+     {
+      Print("[G-MULTI] ST00 FAIL: ", poolName, " magic <= 0");
+      g_selftestOk = false;
+      return;
+     }
+   for(int i = 0; i < ArraySize(pool); i++)
+     {
+      if(pool[i] == magic)
+        {
+         Print("[G-MULTI] ST00 FAIL: duplicate ", poolName, " magic ", magic);
+         g_selftestOk = false;
+         return;
+        }
+     }
+   int n = ArraySize(pool);
+   ArrayResize(pool, n + 1);
+   pool[n] = magic;
+  }
+
+// Current deployment: every active production magic is in the gate pool and
+// the protected flatten pool. MagicGuard is not a fleet participant.
+void MegAddActiveMagic(const int magic)
+  {
+   MegPoolAdd(g_protectedMagics, magic, "protected");
+   MegPoolAdd(g_gateMagics, magic, "gate");
+  }
+
+//+------------------------------------------------------------------+
 int OnInit()
   {
+   if(!GGate_RequireHedgingAccount())
+      return INIT_FAILED;
+
    g_trade.SetExpertMagicNumber(MagicGuard);
-   g_protectedMagics[0] = MagicSwingM5;
-   g_protectedMagics[1] = MagicScalp1x1;
-   g_protectedMagics[2] = MagicScalp3x1;
-   g_protectedMagics[3] = MagicR21A;
-   g_protectedMagics[4] = MagicR21B;
-   g_protectedMagics[5] = MagicR22Pass6060;  // 2026-10-09: demo deployment, see magic comment above
-   g_protectedMagics[6] = MagicWinrate1250;  // 2026-10-11: rank #1 by Profit/(DD*Lot) in the WINRATE table
-   g_protectedMagics[7] = MagicWinrate3257;  // 2026-10-11: rank #3
-   g_protectedMagics[8] = MagicWinrate667;   // 2026-10-11: rank #5 -- WATCH (win/loss-size asymmetry)
-   g_protectedMagics[9] = MagicR22CDHV7794;  // 2026-10-13: best-D pick, PF 2.27, 345 positions
-   g_protectedMagics[10] = MagicR22CDHV2098; // 2026-10-13: best-C pick, PF 2.47 (best of batch), 370 positions
-
-   g_gateMagics[0] = MagicSwingM5;
-   g_gateMagics[1] = MagicSwingM15;
-   g_gateMagics[2] = MagicScalp1x1;
-   g_gateMagics[3] = MagicScalp3x1;
-   g_gateMagics[4] = MagicR21A;
-   g_gateMagics[5] = MagicR21B;
-   g_gateMagics[6] = MagicBot4_v49;
-   g_gateMagics[7] = MagicR22Pass6060;  // 2026-10-09: demo deployment, see magic comment above
-   g_gateMagics[8] = MagicWinrate1250;  // 2026-10-11: rank #1 by Profit/(DD*Lot) in the WINRATE table --
-                                        // highest gate priority of the 3 new magics (placed first so it
-                                        // wins ties when multiple WINRATE-family magics signal same bar)
-   g_gateMagics[9] = MagicWinrate3257;  // 2026-10-11: rank #3
-   g_gateMagics[10] = MagicWinrate667;  // 2026-10-11: rank #5 -- lowest gate priority of the 3, pending
-                                        // live data to resolve the win/loss-size-asymmetry WATCH flag
-   g_gateMagics[11] = MagicR22CDHV2098; // 2026-10-13: best-C pick, PF 2.47 (best of batch) -- placed
-                                        // ahead of the D pick since it ranked higher on PF/net
-   g_gateMagics[12] = MagicR22CDHV7794; // 2026-10-13: best-D pick, PF 2.27, 88.7% win rate (best win% of batch)
-   // NOTE: MagicBot4_v50 intentionally NOT in g_gateMagics -- only one bot4
-   // build is ever attached to a chart at a time; GGate_ShouldOpen() fail-opens
-   // for any magic Guard doesn't recognize, so if v1_50 is the live build
-   // instead of v1_49, it simply runs ungated rather than silently blocked.
-   // Swap MagicBot4_v49 -> MagicBot4_v50 here if v1_50 becomes the live build.
-
    g_selftestOk = true;
+   ArrayResize(g_protectedMagics, 0);
+   ArrayResize(g_gateMagics, 0);
+   MegAddActiveMagic(MagicSwingM5);
+   MegAddActiveMagic(MagicSwingM15);     // 54322: was gate-only; now also flattened
+   MegAddActiveMagic(MagicScalp1x1);
+   MegAddActiveMagic(MagicScalp3x1);
+   MegAddActiveMagic(MagicR21A);
+   MegAddActiveMagic(MagicR21B);
+   MegAddActiveMagic(MagicBot4_v49);     // 40001: was gate-only; now also flattened
+   MegAddActiveMagic(MagicTest4_v52);    // 54340
+   MegAddActiveMagic(MagicR22Pass6060);
+   MegAddActiveMagic(MagicWinrate1250);
+   MegAddActiveMagic(MagicWinrate3257);
+   MegAddActiveMagic(MagicWinrate667);
+   MegAddActiveMagic(MagicR22CDHV2098);
+   MegAddActiveMagic(MagicR22CDHV7794);
+
+   if(LossCooldownMinNetLossUsd < 0.0)
+     {
+      Print("[G-MULTI] INIT FAILED: LossCooldownMinNetLossUsd (",
+            DoubleToString(LossCooldownMinNetLossUsd, 2),
+            ") must be nonnegative USD. The cooldown arms only when lifecycle net is below -this.");
+      return INIT_FAILED;
+     }
 
    if(FtmoInitialBalance <= 0 || FtmoMaxLossPct <= 0 || DailySoftLossPct <= 0)
      {
       Print("[G-MULTI] ST00 FAIL: FtmoInitialBalance/FtmoMaxLossPct/DailySoftLossPct must be > 0");
       g_selftestOk = false;
      }
+   if(ArraySize(g_protectedMagics) != ArraySize(g_gateMagics) || ArraySize(g_protectedMagics) <= 0)
+     {
+      Print("[G-MULTI] ST00 FAIL: protected and gate pools must both be non-empty and the same size");
+      g_selftestOk = false;
+     }
    for(int i = 0; i < ArraySize(g_protectedMagics); i++)
      {
-      if(g_protectedMagics[i] <= 0)
+      if(g_protectedMagics[i] <= 0 || g_protectedMagics[i] == MagicGuard)
         {
-         Print("[G-MULTI] ST00 FAIL: protected magic #", i, " is <= 0");
+         Print("[G-MULTI] ST00 FAIL: protected magic #", i, " is <= 0 or is MagicGuard");
+         g_selftestOk = false;
+        }
+      bool inGate = false;
+      for(int j = 0; j < ArraySize(g_gateMagics); j++)
+         if(g_gateMagics[j] == g_protectedMagics[i])
+            inGate = true;
+      if(!inGate)
+        {
+         Print("[G-MULTI] ST00 FAIL: protected magic ", g_protectedMagics[i], " is missing from the gate pool");
          g_selftestOk = false;
         }
       for(int j = i + 1; j < ArraySize(g_protectedMagics); j++)
          if(g_protectedMagics[i] == g_protectedMagics[j])
            {
             Print("[G-MULTI] ST00 FAIL: duplicate protected magic ", g_protectedMagics[i]);
+            g_selftestOk = false;
+           }
+     }
+   for(int i = 0; i < ArraySize(g_gateMagics); i++)
+     {
+      if(g_gateMagics[i] <= 0 || g_gateMagics[i] == MagicGuard)
+        {
+         Print("[G-MULTI] ST00 FAIL: gate magic #", i, " is <= 0 or is MagicGuard");
+         g_selftestOk = false;
+        }
+      for(int j = i + 1; j < ArraySize(g_gateMagics); j++)
+         if(g_gateMagics[i] == g_gateMagics[j])
+           {
+            Print("[G-MULTI] ST00 FAIL: duplicate gate magic ", g_gateMagics[i]);
             g_selftestOk = false;
            }
      }
@@ -1120,13 +1580,20 @@ int OnInit()
             " magics=", MagicSwingM5, ",", MagicScalp1x1, ",", MagicScalp3x1, ",", MagicR21A, ",", MagicR21B, ",", MagicR22Pass6060,
             " flatten_hard=", UseFlattenOnHardFloor ? "ON" : "OFF",
             " flatten_daily=", UseFlattenOnDailyFloor ? "ON" : "OFF",
-            " (Phase 1 = these two flatten flags are the ONLY things that can touch a position; every"
-            " other brake here only publishes MEG_ GlobalVariables for a future Phase-2 EA-side read)");
+            " flatten_profit=", UseProfitTargetFlatten ? "ON" : "OFF",
+            " basket_sl=", UseBasketSLGuard ? "ON" : "OFF",
+            " (hard/daily flags are not the only closers: profit flatten and basket SL close when enabled."
+            " Gap, Friday, and loss cooldown set BLOCK_NEW and do not flatten."
+            " Trading EAs consume BLOCK_NEW. Startup publishes that block until the first tick.)");
 
    if(!g_selftestOk)
       return INIT_FAILED;
 
-   Publish(MEG_VETO_OK);
+   // Real floors, cooldown, and profit state are not known until OnTick.
+   // Publish a coherent fail-closed STARTUP block first. The first OnTick
+   // replaces it with ComputeVeto()/ComputeFlattenReason(). A stale or missing
+   // snapshot still fail-opens in the trading EAs.
+   Publish(MEG_VETO_STARTUP, MEG_VETO_OK);
    return INIT_SUCCEEDED;
   }
 
@@ -1246,6 +1713,36 @@ void UpdateFleetOpenCooldownGate()
    GlobalVariableSet(GGATE_VAR_FLEETOPEN_SEC, (double)FleetOpenCooldownSeconds);
   }
 
+// A floor flatten that is no longer true must not keep attributing later
+// closes. Protected positions that are still open clear that pending reason.
+void ClearStaleFloorEpisodeReason()
+  {
+   if(!g_episodeActive)
+      return;
+   bool hardPending  = (StringFind(g_episodeEndReasonPending, "HARD_FLOOR") == 0);
+   bool dailyPending = (StringFind(g_episodeEndReasonPending, "DAILY_FLOOR") == 0);
+   if(!hardPending && !dailyPending)
+      return;
+   int openNow = 0;
+   FleetFloatingTotal(openNow);
+   if(openNow <= 0)
+      return;
+   bool hardActive  = (UseFlattenOnHardFloor && EquityAtOrBelowHardFloor());
+   bool dailyActive = (UseFlattenOnDailyFloor && EquityAtOrBelowDailyFloor());
+   if(hardPending && !hardActive)
+     {
+      Print("[G-MULTI] HARD_FLOOR flatten is no longer active and positions remain -- clearing stale episode reason");
+      g_episodeEndReasonPending = "NATURAL";
+      g_episodeReasonBoundStart = 0;
+     }
+   else if(dailyPending && !dailyActive)
+     {
+      Print("[G-MULTI] DAILY_FLOOR flatten is no longer active and positions remain -- clearing stale episode reason");
+      g_episodeEndReasonPending = "NATURAL";
+      g_episodeReasonBoundStart = 0;
+     }
+  }
+
 void OnTick()
   {
    DetectWeekendGap();
@@ -1253,10 +1750,15 @@ void OnTick()
 
    if(UseEntryBarGate)
       MaybeRankAndPublishGate();
+   else
+      GlobalVariableSet(GGATE_VAR_PRI_COUNT, 0.0); // gate off: heartbeat must not keep an old ranking alive
 
+   MegProcessCooldownQueue();  // before the veto, so a loss that already closed arms this tick
    int veto = ComputeVeto();
-   Publish(veto);
-   MaybeFlatten(veto);
+   int flattenReason = ComputeFlattenReason();
+   Publish(veto, flattenReason);
+   MaybeFlatten(flattenReason);
+   ClearStaleFloorEpisodeReason();
    UpdateFleetEpisode();   // 2026-10-02: after MaybeFlatten so a same-tick flatten is caught as
                             // EPISODE_END with the right end_reason, not silently as "NATURAL"
    UpdateBasketSL();       // 2026-10-09: logged-only by default (UseBasketSLGuard=false); see input
