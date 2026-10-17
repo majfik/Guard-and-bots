@@ -1,0 +1,38 @@
+# Configuration matrix
+
+Fifteen `.set` files. The same names exist in [VALIDATED_LIVE_CONFIGS](../VALIDATED_LIVE_CONFIGS) (historical, pinned, do not edit) and [VALIDATED_LIVE_CONFIGS_V2](../VALIDATED_LIVE_CONFIGS_V2) (candidate, not deployed).
+
+Every trading magic below is in both Guard pools (`g_gateMagics` and `g_protectedMagics`). `MagicGuard` 61998 is in neither. Pool membership is the source list in [ARCHITECTURE.md](ARCHITECTURE.md), not a guess from the set filename.
+
+V2 bundle status: `BLOCKED_PENDING_RUNTIME_CONFIRMATION` because `DonchianExitPeriod=1` is still illegal. A MetaEditor result of 0 errors and 0 warnings does not make the bundle deployment ready. Every V2 file is at least `PENDING_REVALIDATION` because this source is not the build the historical files were baselined against. No row is economically validated. No row is a profitability claim.
+
+| File | EA source | Magic | Chart TF | Pools | V2 status | Material risk |
+| --- | --- | --- | --- | --- | --- | --- |
+| `M5_SWING_CANDD_v2_MAGIC54321.set` | `Experts/bot1_regime2.0.mq5` | 54321 | M5 | both | `PENDING_REVALIDATION` | Set values match the historical file. Source behavior changed, so the file still needs revalidation. |
+| `M15_SWING_v1_MAGIC54322.set` | `Experts/bot1_regime2.0.mq5` | 54322 | M15 | both | `PENDING_REVALIDATION` | Same. 54322 is in the protected flatten pool as well as the gate pool. |
+| `M15_SCALP_1x1_v3_MAGIC54323.set` | `Experts/bot1_regime2.0.mq5` | 54323 | M15 | both | `PENDING_REVALIDATION` | Set values match the historical file. Source changed. |
+| `M15_SCALP_CONCURRENT_3x1_MAGIC54324.set` | `Experts/bot1_regime2.0.mq5` | 54324 | M15 | both | `PENDING_REVALIDATION` | Set values match the historical file. Source changed. |
+| `bot1_regime2.0_PRODUCTION_1250_MAGIC54325_M5.set` | `Experts/bot1_regime2.0.mq5` | 54325 | M5 | both | `PENDING_REVALIDATION` | Semantic repair. Historical `ExitMode=0`: 70% close at 900 points sets stage=2, so the 20% close at 1200 never runs after that. V2 introduces a 20% close at 900 and a later 70% close at 1200. Mandatory combined A/B. |
+| `bot1_regime2.0_PRODUCTION_667_MAGIC54326_M5.set` | `Experts/bot1_regime2.0.mq5` | 54326 | M5 | both | `PENDING_REVALIDATION` | Semantic repair. Historical `ExitMode=0`: 20% and 70% both become eligible at 600 points; the same pass runs 20% then 70% of what remains. V2 keeps 20% at 600 and moves 70% to 601. Mandatory combined A/B. |
+| `bot1_regime2.0_PRODUCTION_3257_MAGIC54327_M15.set` | `Experts/bot1_regime2.0.mq5` | 54327 | M15 | both | `PENDING_REVALIDATION` | Distances already legal (900 then 1800). Set values match history. Source changed. |
+| `bot1_regime2.1_PRODUCTION_A_BEONLY.set` | `Experts/bot1_regime2.1.mq5` | 54510 | not stated | both | `PENDING_REVALIDATION` | Historical `LotType` key is prefixed with U+FEFF, so it may not have loaded. Source default is `LOT_FIXED` (0). Candidate key is `LotType=1` (`LOT_RISK`). Potential sizing change until live deal volumes prove 1 was loaded. Mandatory revalidation. |
+| `bot1_regime2.1_PRODUCTION_B_LIVEGATE_RR6.5.set` | `Experts/bot1_regime2.1.mq5` | 54511 | not stated | both | `PENDING_REVALIDATION` | Same BOM / `LotType=1` uncertainty as 54510. Mandatory revalidation. |
+| `bot1_regime2.2_PASS6060_PRODUCTION_MAGIC220001.set` | `Experts/bot1_regime2.2.mq5` | 220001 | M5 | both | `PENDING_REVALIDATION` | Set values match the historical file. Source changed. |
+| `bot1_regime2.2_PRODUCTION_7794_MAGIC220201.set` | `Experts/bot1_regime2.2.mq5` | 220201 | M15 | both | `PENDING_REVALIDATION` | Set values match the historical file. Source changed. |
+| `bot1_regime2.2_PRODUCTION_2098_MAGIC220202.set` | `Experts/bot1_regime2.2.mq5` | 220202 | M15 | both | `PENDING_REVALIDATION` | Semantic repair. Historical `ExitMode=0` and `UseStagedBE=true`: 70% at 500 points sets stage=2, so the 20% close at 1200 never runs and `UseStagedBE` does not move the stop on that path. V2 introduces a 20% close at 500 and a later 70% close at 1200. The 20% completion newly activates the `UseStagedBE` move at 500. Combined A/B must include that move. |
+| `bot4_v149_R23_rank2_MAGIC40001.set` | `Experts/bot4_TREND_FX_v1_49.mq5` | 40001 | M15 | both | `BLOCKED_PENDING_RUNTIME_CONFIRMATION` | `DonchianExitPeriod=1` is not a legal `ENUM_H1_EXIT_PERIOD` (8, 10, 14) while `UseDonchianExit=true`. Value preserved. `OnInit` rejects it. Holds the whole V2 bundle. No set threshold changed. Executable behavior changed materially: `MaxOpenPyramids`, `MaxSameDirectionPyramids`, and `GlobalEquityStopPct` (4% strategy-wide equity breaker) now apply to magic 40001. Feature-on/off A/B and runtime tests are mandatory for each. |
+| `v52_R23_v1_MAGIC54340.set` | `Experts/test4_clean_HYBRID_v52.mq5` | 54340 | not stated | both | `PENDING_REVALIDATION` | No set threshold changed. Executable behavior changed materially: TP1 and TP2 are one-shot per ticket instead of repeated per-tick partials, and the stage is restored after restart. Mandatory revalidation. Chart timeframe is not in the file. |
+| `EA_G_PortfolioGuard_MultiEA_PRODUCTION_20261013.set` | `Experts/EA_G_PortfolioGuard_MultiEA.mq5` | 61998 (`MagicGuard`, not a pool member) | chart not stated; `GateTimeframe` M30 | publishes both pools | `PENDING_REVALIDATION` | Adds `MagicTest4_v52=54340`, removes `MagicBot4_v50=60001`, writes `LossCooldownMinNetLossUsd=5.0` and `LossCooldownArmOnBasketSL=true`. Profit flatten stays on at 1000. Cooldown stays 360 minutes. Not the Donchian blocker. |
+
+## Shared status
+
+| Fact | Value |
+| --- | --- |
+| Bundle | `BLOCKED_PENDING_RUNTIME_CONFIRMATION` |
+| `deployment_ready` | false |
+| Economically validated | false |
+| Deployed | false |
+| Historical hashes | pinned in `tests/historical_baseline_sha256.json`; `--write-manifest` does not refresh that pin |
+| Code/test pass | not deployment readiness |
+
+The three stage repairs and the two BOM/sizing files require mandatory A/B or live-volume validation. Every other file still needs revalidation because the source changed.
