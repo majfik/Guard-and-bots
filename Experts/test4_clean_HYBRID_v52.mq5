@@ -166,6 +166,7 @@ datetime lastCestDayStart = 0;
 
 struct StageTracker {
    ulong ticket;
+   ulong ident;         // POSITION_IDENTIFIER, stable across a partial close
    int stage;           // 0=open, 1=TP1 closed, 2=TP2 closed, 3=trailing
    double profitLocked;
 };
@@ -588,10 +589,167 @@ double CalculateLotSize(double sl, double entryPrice) {
    return NormalizeVolume(lotSize);
 }
 
+// Wires the existing StageTracker so each ticket takes TP1 once and TP2 once.
+// Percents, distances, and trailing activation are unchanged. Stage advances
+// only when that stage's plan is fully done, so a pending TP1 cannot be
+// consumed by TP2 and cannot be re-percented on the next tick.
+#define TEST4_STAGE_SLOTS 64
+
+string Test4StagePrefix() {
+   return "T4STG_" + IntegerToString((long)AccountInfoInteger(ACCOUNT_LOGIN)) + "_" + _Symbol + "_";
+}
+
+string Test4StageGv(const ulong ident) {
+   return Test4StagePrefix() + IntegerToString((long)ident);
+}
+
+int Test4FindStage(const ulong ticket) {
+   int n = ArraySize(stages);
+   for(int i = 0; i < n; i++)
+      if(stages[i].ticket == ticket) return i;
+   return -1;
+}
+
+bool Test4IdentStillOpen(const ulong ident, const ulong ticket) {
+   if(ticket != 0 && PositionSelectByTicket(ticket))
+      return true;
+   if(ident == 0)
+      return false;
+   for(int i = PositionsTotal() - 1; i >= 0; i--) {
+      ulong openTicket = PositionGetTicket(i);
+      if(openTicket == 0) continue;
+      if((ulong)PositionGetInteger(POSITION_IDENTIFIER) == ident)
+         return true;
+   }
+   return false;
+}
+
+bool Test4IdentConfirmedClosed(const ulong ident) {
+   if(ident == 0) return false;
+   if(Test4IdentStillOpen(ident, 0)) return false;
+   if(!HistorySelectByPosition(ident)) return false;
+   return (HistoryDealsTotal() > 0);
+}
+
+int Test4StageFromHistory(const ulong ident) {
+   if(ident == 0 || !HistorySelectByPosition(ident)) return 0;
+   int found = 0;
+   int deals = HistoryDealsTotal();
+   for(int i = 0; i < deals; i++) {
+      ulong deal = HistoryDealGetTicket(i);
+      if(deal == 0) continue;
+      long entry = HistoryDealGetInteger(deal, DEAL_ENTRY);
+      if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_OUT_BY) continue;
+      string comment = HistoryDealGetString(deal, DEAL_COMMENT);
+      if(StringFind(comment, "|TP2") >= 0) found = MathMax(found, 2);
+      else if(StringFind(comment, "|TP1") >= 0) found = MathMax(found, 1);
+   }
+   return found;
+}
+
+void Test4RemoveStageSlot(const int idx) {
+   int last = ArraySize(stages) - 1;
+   if(idx < 0 || idx > last) return;
+   stages[idx] = stages[last];
+   ArrayResize(stages, last);
+}
+
+void Test4PruneClosedStages() {
+   for(int i = ArraySize(stages) - 1; i >= 0; i--) {
+      if(Test4IdentStillOpen(stages[i].ident, stages[i].ticket))
+         continue;
+      if(!Test4IdentConfirmedClosed(stages[i].ident))
+         continue;
+      string key = Test4StageGv(stages[i].ident);
+      if(stages[i].ident != 0 && GlobalVariableCheck(key))
+         GlobalVariableDel(key);
+      Test4RemoveStageSlot(i);
+   }
+}
+
+void Test4PruneStageGlobals() {
+   string prefix = Test4StagePrefix();
+   for(int i = GlobalVariablesTotal() - 1; i >= 0; i--) {
+      string name = GlobalVariableName(i);
+      if(StringFind(name, prefix) != 0) continue;
+      ulong ident = (ulong)StringToInteger(StringSubstr(name, StringLen(prefix)));
+      if(Test4IdentStillOpen(ident, 0)) continue;
+      if(!Test4IdentConfirmedClosed(ident)) continue;
+      GlobalVariableDel(name);
+   }
+}
+
+bool Test4RememberStage(const ulong ticket, const ulong ident, const int stage) {
+   int idx = Test4FindStage(ticket);
+   if(idx >= 0) {
+      stages[idx].stage = stage;
+      if(ident != 0) stages[idx].ident = ident;
+      return true;
+   }
+   Test4PruneClosedStages();
+   int n = ArraySize(stages);
+   if(n >= TEST4_STAGE_SLOTS) {
+      Print("[TEST4] stage table full; not overwriting an active slot ticket=", ticket);
+      return false;
+   }
+   ArrayResize(stages, n + 1);
+   stages[n].ticket = ticket;
+   stages[n].ident = ident;
+   stages[n].stage = stage;
+   stages[n].profitLocked = 0.0;
+   return true;
+}
+
+int Test4LoadPersistedStage(const ulong ticket) {
+   if(!PositionSelectByTicket(ticket)) return 0;
+   ulong ident = (ulong)PositionGetInteger(POSITION_IDENTIFIER);
+   if(ident == 0) ident = ticket;
+   string key = Test4StageGv(ident);
+   int stage = 0;
+   if(GlobalVariableCheck(key))
+      stage = (int)GlobalVariableGet(key);
+   if(stage <= 0)
+      stage = Test4StageFromHistory(ident);
+   if(stage > 0) {
+      GlobalVariableSet(key, (double)stage);
+      Test4RememberStage(ticket, ident, stage);
+   }
+   return stage;
+}
+
+int Test4GetStage(const ulong ticket) {
+   int idx = Test4FindStage(ticket);
+   if(idx >= 0) return stages[idx].stage;
+   return Test4LoadPersistedStage(ticket);
+}
+
+void Test4SetStage(const ulong ticket, const int stage) {
+   if(ticket == 0) return;
+   ulong ident = 0;
+   if(PositionSelectByTicket(ticket)) {
+      ident = (ulong)PositionGetInteger(POSITION_IDENTIFIER);
+      if(ident == 0) ident = ticket;
+      GlobalVariableSet(Test4StageGv(ident), (double)stage);
+   }
+   Test4RememberStage(ticket, ident, stage);
+}
+
+void Test4RestoreOpenStages() {
+   Test4PruneStageGlobals();
+   for(int i = PositionsTotal() - 1; i >= 0; i--) {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if((int)PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      Test4LoadPersistedStage(ticket);
+   }
+}
+
 //+------------------------------------------------------------------+
 //| STAGE PROFIT MANAGEMENT (NEW!)                                  
 //+------------------------------------------------------------------+
 void ManageStagedProfits() {
+   Test4PruneClosedStages();
    for(int i = PositionsTotal() - 1; i >= 0; i--) {
       if(position.SelectByIndex(i) && position.Symbol() == _Symbol && 
          position.Magic() == MagicNumber) {
@@ -610,21 +768,43 @@ void ManageStagedProfits() {
             profitDistance = (entryPrice - currentPrice) / _Point;
          }
 
-         // STAGE 1: Close 25% at 30 pips
-         if(UseStageExits && profitDistance >= TP1_Distance && position.Volume() > 0.01) {
+         int stageNow = Test4GetStage(ticket);
+         bool tp1StillOpen = false;
+
+         // STAGE 1: Close 25% at 30 pips. Once per ticket.
+         if(UseStageExits && stageNow < 1 && profitDistance >= TP1_Distance && position.Volume() > 0.01) {
             double volumeToClose = NormalizeVolume(position.Volume() * TP1_ClosePercent);
+            volumeToClose = GGate_PartialPlanVolume(ticket, 1, volumeToClose);
             if(volumeToClose >= 0.01) {
-               GGate_ClosePartialTagged(trade, ticket, volumeToClose, GGATE_REASON_TP1);
-               Print("TP1 Hit: Closed ", volumeToClose, " at ", TP1_Distance, " pips");
+               ulong tp1Deal = 0;
+               double tp1Filled = 0;
+               int tp1Outcome = GGate_ClosePartialTaggedEx(trade, ticket, volumeToClose, GGATE_REASON_TP1, tp1Deal, tp1Filled, "", 1);
+               if(GGate_PartialPlanApply(ticket, 1, volumeToClose, tp1Outcome, tp1Filled))
+                  Test4SetStage(ticket, 1);
+               else if(tp1Outcome == GGATE_CLOSE_PENDING || tp1Outcome == GGATE_CLOSE_PARTIAL)
+                  tp1StillOpen = true;
+               Print("TP1 ", GGate_CloseOutcomeText(tp1Outcome), ": closed ", tp1Filled, " of ", volumeToClose,
+                     " at ", TP1_Distance, " pips");
             }
          }
 
-         // STAGE 2: Close 30% at 50 pips
-         if(UseStageExits && profitDistance >= TP2_Distance && position.Volume() > 0.01) {
+         if(!position.SelectByTicket(ticket))
+            continue;
+         stageNow = Test4GetStage(ticket);
+
+         // STAGE 2: Close 30% at 50 pips of the volume still open. Once per ticket.
+         // Not started while TP1's own close is still pending or only partly filled.
+         if(UseStageExits && !tp1StillOpen && stageNow < 2 && profitDistance >= TP2_Distance && position.Volume() > 0.01) {
             double volumeToClose = NormalizeVolume(position.Volume() * TP2_ClosePercent);
+            volumeToClose = GGate_PartialPlanVolume(ticket, 2, volumeToClose);
             if(volumeToClose >= 0.01) {
-               GGate_ClosePartialTagged(trade, ticket, volumeToClose, GGATE_REASON_TP2);
-               Print("TP2 Hit: Closed ", volumeToClose, " at ", TP2_Distance, " pips");
+               ulong tp2Deal = 0;
+               double tp2Filled = 0;
+               int tp2Outcome = GGate_ClosePartialTaggedEx(trade, ticket, volumeToClose, GGATE_REASON_TP2, tp2Deal, tp2Filled, "", 2);
+               if(GGate_PartialPlanApply(ticket, 2, volumeToClose, tp2Outcome, tp2Filled))
+                  Test4SetStage(ticket, 2);
+               Print("TP2 ", GGate_CloseOutcomeText(tp2Outcome), ": closed ", tp2Filled, " of ", volumeToClose,
+                     " at ", TP2_Distance, " pips");
             }
          }
 
@@ -676,6 +856,11 @@ void CheckForTradingSignals() {
    // enabled. Catches the race the price-distance gate above can't (multiple EAs reading its
    // once-per-tick snapshot before anyone's open registers).
    if(!GGate_FleetOpenCooldownOk())
+      return;
+
+   // Final pre-order gate. Missing or stale Guard state fail-opens.
+   // FLAT_REQ is not read.
+   if(GGate_EntryBlocked(MagicNumber, "hybrid"))
       return;
 
    datetime currentBarTime = iTime(_Symbol, _Period, 0);
@@ -1132,6 +1317,18 @@ void DrawRightLegend() {
 //| OnInit                                                           
 //+------------------------------------------------------------------+
 int OnInit() {
+   if(!GGate_RequireHedgingAccount())
+      return INIT_FAILED;
+   string stageWhy = "";
+   if(!GGate_ValidateStageConfig(UseStageExits, false,
+                                 TP1_Distance, TP2_Distance, TP1_ClosePercent, TP2_ClosePercent,
+                                 0.0, 0.0, 0.0,
+                                 TrailingActivation, TrailingDistance,
+                                 MaxBuyPositions, MaxSellPositions, -1,
+                                 stageWhy)) {
+      Print(stageWhy);
+      return INIT_FAILED;
+   }
    trade.SetExpertMagicNumber(MagicNumber);
 
    atrHandle = iATR(_Symbol, _Period, ADRPeriod);
@@ -1191,6 +1388,7 @@ int OnInit() {
 
    startDayBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    ArrayResize(stages, 0);
+   Test4RestoreOpenStages();
 
    Print("═════════════════════════════════════════");
    Print("test4_clean_HYBRID v5.2 Initialized");
