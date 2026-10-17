@@ -1,118 +1,115 @@
-# Guard Features: What Each One Does, Current State, Known Issues
+# Guard features
 
-Source of truth for current ON/OFF state: `VALIDATED_LIVE_CONFIGS/EA_G_PortfolioGuard_MultiEA_PRODUCTION_20261013.set`.
-Read that file directly for exact current values -- this doc explains WHAT each feature does and
-WHY it's built that way; the `.set` file is the live truth of what's actually enabled right now.
+Current behavior is the source plus the set that is actually loaded. Two set directories exist:
 
-## Protected magics vs. gate-priority-pool magics (important distinction)
+- [VALIDATED_LIVE_CONFIGS](../VALIDATED_LIVE_CONFIGS) is the historical baseline. It is pinned by [historical_baseline_sha256.json](../tests/historical_baseline_sha256.json). Do not edit it. It is not a deployment instruction for this source tree.
+- [VALIDATED_LIVE_CONFIGS_V2](../VALIDATED_LIVE_CONFIGS_V2) is a candidate. Bundle status is `BLOCKED_PENDING_RUNTIME_CONFIRMATION` because bot4 `DonchianExitPeriod=1`. A clean MetaEditor compile does not clear that block. It is not deployed and not economically validated. See [CONFIGURATION_MATRIX.md](CONFIGURATION_MATRIX.md).
 
-Two separate lists exist in `EA_G_PortfolioGuard_MultiEA.mq5`:
-- **`g_gateMagics[]`** -- every magic that participates in the 1-per-bar PF-priority entry gate.
-- **`g_protectedMagics[]`** -- every magic covered by basket-SL / profit-target / hard/daily-floor
-  FLATTEN protection.
+Source defaults are not the historical values. In particular, profit-target flatten is on in both the historical Guard set and the V2 Guard set, and the cooldown length in both sets is 360 minutes, not the source default of 120.
 
-These lists are NOT identical. As of the last review, `MagicSwingM15` (54322) and `MagicBot4_v49`
-(40001) are in the gate pool but NOT in the protected-flatten list -- meaning they participate in
-entry-gating but get no flatten protection. This might be intentional (a deliberate "let this one
-run independently of the flatten safety net") or might be an oversight; flagged for review, not
-resolved.
+No number in an old source comment is a profitability claim for this tree.
 
-## Fleet-wide brakes (block ALL new entries fleet-wide while active)
+## Classifications
 
-### LOSS_COOLDOWN
-`UseLossCooldown` / `LossCooldownMinutes` (currently 120). After ANY protected magic closes a
-losing trade, blocks new entries fleet-wide for this many minutes. Published-only via
-GlobalVariable (`GGate_LossCooldownOk()`) -- see `ARCHITECTURE.md` gate #3.
-**Real observed cost** (from a multi-day log analysis): fired 47 times across a ~9-day window,
-totaling ~1,639 minutes of fleet-wide no-new-trades time (avg 35 min/episode, longest single
-episode ~218 min). This is the cost side to weigh against whatever losses it prevents --
-not inherently good or bad, just the real number to reason about.
+| Class | Meaning here |
+| --- | --- |
+| active | The named flag is true in the historical Guard set and in the V2 Guard set, or the code path runs on every entry. |
+| risk-reducing | The mechanism can block or close. That is not evidence it improves results. |
+| unproven | A candidate change whose economic effect has not been revalidated. |
+| blocked | Must not be deployed. bot4 `DonchianExitPeriod=1`, and therefore the whole V2 bundle. |
+| disabled | The flag exists and is false in both Guard sets, or the magic was removed from the deployment. |
 
-### DAILY_FLOOR
-Daily soft-loss limit, tighter than the FTMO account's real daily limit by design (`DailySoftLossPct`,
-currently 3.5%, vs. FTMO's real 5%). Blocks new entries once today's losses hit this %.
-Observed: fired 34 times, but very briefly each time (avg 0.3 min/episode) -- consistent with a
-threshold that's crossed and then the day resets quickly, or trades recovering fast.
+## Guard set: historical versus V2
 
-### PROFIT_TARGET (see also the flatten below -- same underlying threshold, two different consumers)
-Blocks new entries once fleet floating profit crosses `ProfitTargetUsd`. Observed: fired 13 times,
-totaling ~929 min (avg 71.5 min/episode, longest ~307 min).
+File: `EA_G_PortfolioGuard_MultiEA_PRODUCTION_20261013.set`.
 
-### FRIDAY backstop
-`UseFridayBackstop`. De-risks ahead of the weekend close -- a portfolio-wide backstop in case any
-single EA's own weekend-handling were ever misconfigured. Fired once in the observed window,
-spanning the full weekend (~2621 min), as expected.
+| Input | Source default | Historical set | V2 candidate |
+| --- | --- | --- | --- |
+| `FtmoInitialBalance` | 10000 | 100000 | 100000 |
+| `UseLossCooldown` | true | true | true |
+| `LossCooldownMinutes` | 120 | 360 | 360 |
+| `LossCooldownMinNetLossUsd` | 5.0 | omitted; new source uses 5.0 | 5.0, written explicitly |
+| `LossCooldownArmOnBasketSL` | true | omitted; new source uses true | true, written explicitly |
+| `UseProfitTargetFlatten` | false | true | true |
+| `ProfitTargetUsd` | 1000 | 1000 | 1000 |
+| `UseBasketSLGuard` | false | true | true |
+| `BasketSLMaxLossUsd` | 1000 | 1200 | 1200 |
+| `UseFlattenOnHardFloor` | false | false | false |
+| `UseFlattenOnDailyFloor` | false | false | false |
+| `UseGapBlock` | true | true | true |
+| `GapDetectHours` / `GapBlockHours` | 6 / 2 | 6 / 2 | 6 / 2 |
+| `UseFridayBackstop` | true | true | true |
+| `FridayBackstopHour` | 16 | 20 | 20 |
+| `GateTimeframe` | source default is M5 | 30 (`PERIOD_M30`) | 30 (`PERIOD_M30`) |
+| `UsePriceDistanceGate` | false | true | true |
+| `MinReentryDistancePoints` | 150 | 300 | 300 |
+| `UseLossCooldownGate` | false | true | true |
+| `UseFleetOpenCooldownGate` | false | true | true |
+| `FleetOpenCooldownSeconds` | 10 | 10 | 10 |
+| `MagicTest4_v52` | 54340 | input absent | 54340 |
+| `MagicBot4_v50` | removed from this source | 60001 | removed |
 
-### Gap block
-`UseGapBlock` / `GapDetectHours` / `GapBlockHours`. Treats a tick gap of >= `GapDetectHours` as a
-weekend/feed-outage gap and blocks new entries for `GapBlockHours` after ticks resume --
-incidentally also catches multi-hour feed outages, not just weekends (documented as "a reasonable
-bonus, not a bug" in the source comment).
+V2 also drops obsolete `MagicBot4_v50`. Loading the historical Guard set onto this source ignores that removed input and takes `MagicTest4_v52=54340` from the source default. The V2 set writes that membership explicitly. Both files are `PENDING_REVALIDATION` because this source is not the build those files were baselined on. The Guard file itself is not the Donchian blocker. The bundle is blocked because bot4 is.
 
-## Flattens (actively close positions, not just block new ones)
+## Pools
 
-### Hard-floor flatten
-Equity below an absolute $ floor (derived from `FtmoInitialBalance` / `FtmoMaxLossPct` /
-`HardFloorBufferUsd`) -> flatten everything. The buffer exists specifically so slippage on the
-CLOSING trade itself can't push equity through the real FTMO breach line.
+Both pools, historical intent and current source, are the 14 magics in [ARCHITECTURE.md](ARCHITECTURE.md). 54322, 40001, and 54340 are in the gate pool and the protected flatten pool. 61998 is in neither. 60001 is not a pool member.
 
-### Profit-target flatten
-`UseProfitTargetFlatten` / `ProfitTargetUsd` (currently $750 in the verify/analysis runs, check
-the live `.set` for the actual production value). **Currently OFF in production** -- logging-only.
-Real historical data shows 1 finished episode that crossed $750 and then gave back an average of
-~$1,879 before the trades actually closed, since nothing was there to lock the profit in. Lowering
-the target fires more often (14x at $250 vs 1x at $750 in the observed window) at the cost of
-capping upside earlier.
+The old statement that 54322 and 40001 are gate-only is stale.
 
-### Basket-SL flatten
-`UseBasketSLGuard` / `BasketSLMaxLossUsd` (currently $1,200 in the live config). Sums floating P&L
-separately for all same-direction (BUY vs SELL) open positions across every protected magic,
-fleet-wide; flattens just that direction's basket if the combined loss crosses the threshold.
-Real data: at $1,200, 1 crossing episode observed, averaging only ~$541 past the threshold before
-it ended on its own -- a relatively well-placed trigger (not obviously too loose).
-**Important when testing different threshold values:** lower thresholds trip on a smaller losing
-move, so they tend to show FEWER distinct episodes (a single big losing stretch counts as one
-episode across its whole decline) while HIGHER thresholds can show MORE distinct episodes if
-price oscillates back and forth across that specific level during a volatile stretch. Don't judge
-"better protection" by raw fire-count alone -- look at the total $ amount capped at each level.
+## BLOCK_NEW
 
-## Entry gates (see `ARCHITECTURE.md` for the full mechanics)
+Class: active, risk-reducing, unproven as a performance change.
 
-1. **1-per-bar PF-priority gate** (`GGate_ShouldOpen`) -- **had a real live bug**, fixed
-   2026-10-15: `GGATE_MAX_PRIORITY_SLOTS` was smaller than the actual number of gate-pool magics,
-   silently truncating the published priority list every bar. `MagicBot4_v49`, `MagicR22Pass6060`,
-   and `MagicWinrate3257` never appeared in the published list for an extended period, meaning
-   their 1-per-bar gate was permanently fail-open (i.e. completely inert, they always got the
-   "allowed" default) the whole time. Confirmed via direct log inspection (`priority_order=` lines
-   only ever printed 10 magics, every bar, before the fix). Fixed by correcting the constant to
-   match the real pool size (13). **Worth re-verifying this fix is correct and the constant will
-   stay in sync if the magic pool grows again** -- it's a manual constant, not derived from the
-   array size automatically, which is itself a latent recurrence risk.
+Every entry path in all five trading EAs calls `GGate_EntryBlocked` before `PositionOpen`, `Buy`, or `Sell`. A coherent fresh `MEG_<symbol>_BLOCK_NEW >= 0.5` refuses the order and logs the veto. Missing, stale, or torn state fail-opens. Guard `OnInit` publishes veto `107` (`STARTUP`) with `BLOCK_NEW` 1 until the first tick computes real state. That startup block is fail-closed only while the snapshot is fresh. `FLAT_REQ` is not an input to that decision.
 
-2. **Price-distance gate** (`GGate_PriceDistanceOk`) -- `UsePriceDistanceGate` /
-   `MinReentryDistancePoints`. Blocks a new entry too close in price to the fleet's last entry.
+test4 magic 54340 takes TP1 once and TP2 once per ticket. That replaces repeated per-tick partials. No set threshold changed. The stage is stored in `T4STG_<login>_<symbol>_<position identifier>` and restored after a reload, so a completed stage does not re-fire. This is a material executable change and is mandatory revalidation. It is not a profitability result.
 
-3. **Loss-cooldown ENFORCEMENT gate** (`GGate_LossCooldownOk`) -- distinct from the fleet-wide
-   LOSS_COOLDOWN brake described above; this is a per-direction enforcement that actual trading
-   EAs check before opening. `UseLossCooldownGate`.
+`BLOCK_NEW` is 1 for every non-OK `ComputeVeto` result. That includes the blanket loss cooldown. It also includes hard-floor and daily-floor breaches even when the matching flatten flag is false: the account can be blocked from new entries without Guard closing positions.
 
-4. **Fleet-wide same-instant pile-on gate** (`GGate_FleetOpenCooldownOk` /
-   `GGate_StampFleetOpen`) -- newest gate (2026-10-14), `UseFleetOpenCooldownGate` /
-   `FleetOpenCooldownSeconds` (currently 10 seconds, fleet-wide). Built specifically to stop
-   same-second multi-magic pile-ons (confirmed live: 16 separate clusters of 2-6 different magics
-   opening at the exact same minute+price despite the price-distance gate being ON, because that
-   gate's snapshot only refreshes once per Guard tick -- too slow to catch simultaneous opens
-   across EAs ticking independently off the same feed). **Verify this is actually suppressing the
-   same-second clusters after being enabled** -- it was built in direct response to a confirmed
-   bug, not yet long-term field-verified at export time.
+## Blanket cooldown versus directional cooldown
 
-## Closure-reason tagging (data-quality issue, not a trading-risk issue)
+These are different mechanisms.
 
-`GGate_BuildCloseComment()` is supposed to tag every close with WHY it closed (EA's own TP/SL
-logic vs. Guard's flatten) so the resulting trade history can be attributed. **Confirmed broken
-at export time**: the OPEN side tags correctly on every trade, but the CLOSE side writes nothing
-useful on ANY magic, including trades closed the same day as the check -- verified by reading the
-raw MT5 Deals export directly, not inferred. This means there is currently no way to tell from
-trade history alone whether a losing trade was the EA's own strategy failing or Guard cutting it
-short. Needs a full trace of every close-side `OrderSend`/`PositionClose()` call across all 6
-trading EAs and the Guard's own flatten code to find where the tag gets dropped.
+Blanket, class active. `UseLossCooldown=true` and `LossCooldownMinutes=360` in both sets. After a protected position is fully closed, Guard computes lifecycle net (profit + swap + commission of every deal on that position id). It arms only when that net is strictly below `-LossCooldownMinNetLossUsd` (5.0 USD in the source and in V2). A commission-only scratch at or above `-5` does not arm. The arm writes `MEG_<symbol>_LOSS_COOLDOWN_UNTIL` and the direction key, and `ComputeVeto` publishes `LOSS_COOLDOWN`, which sets `BLOCK_NEW` for the whole fleet until that datetime. One position id is marked once in `MEG_CDMARK_*` so it cannot arm twice. `LossCooldownArmOnBasketSL=true` means a basket-SL full close may arm. Exact basket close orders are exempt only when that flag is false.
+
+Directional gate, class active in both sets (`UseLossCooldownGate=true`). `GGate_LossCooldownOk` reads only `LOSS_COOLDOWN_UNTIL_BUY` or `_SELL` for the candidate direction, and only when Guard has published the enable flag. It does not clear or narrow `BLOCK_NEW`.
+
+The source default of 120 minutes is not the historical value and not the V2 value.
+
+## Profit, basket, hard floor, daily floor
+
+Profit target, class active and risk-reducing. Both sets set `UseProfitTargetFlatten=true` and `ProfitTargetUsd=1000`. When protected floating P&L reaches 1000 with at least one protected position open, Guard latches and closes those legs, and `BLOCK_NEW` stays up while the latch is active. The latch expires after 3600 seconds if legs remain. This is not "off" and it is not a measured improvement.
+
+Basket SL, class active and risk-reducing. Both sets set `UseBasketSLGuard=true` and `BasketSLMaxLossUsd=1200`. One direction across the gate-pool magics is closed with reason `BSK`. The other direction is left. This does not publish a `MEG_VETO_*` code. It can arm the loss cooldown when the lifecycle net qualifies.
+
+Hard floor, flatten disabled, veto still possible. `UseFlattenOnHardFloor=false` in both sets, so Guard does not close on the hard floor. `ComputeVeto` still returns `HARD_FLOOR` when equity is at or below `HardFloorLevel()`: `FtmoInitialBalance - FtmoInitialBalance * (FtmoMaxLossPct/100) + HardFloorBufferUsd`. Both sets use 100000, 10 percent, and a 50 USD buffer, which is the level 90050. New entries can still be blocked. Positions are not flattened by this flag while it is false.
+
+Daily floor, same split. `UseFlattenOnDailyFloor=false`. `DailySoftLossPct=3.5`. The veto can still set `BLOCK_NEW`. The daily reset depends on `ServerToCetOffsetHours`, which the source marks as broker-specific. Neither set is evidence that offset is correct for a given broker.
+
+Gap block and Friday backstop, class active brakes. They set `BLOCK_NEW`. They do not flatten. Friday hour in both sets is 20. Gap detect/block in both sets is 6 hours then 2 hours.
+
+## Other entry gates
+
+| Gate | Both sets | Class |
+| --- | --- | --- |
+| 1-per-bar priority (`GGate_ShouldOpen`) | EA default `UseGuardBarGate=true`; Guard ranks the gate pool | active, risk-reducing, unproven |
+| Price distance | enabled, 300 points (source default 150) | active, risk-reducing, unproven |
+| Fleet-open stamp | enabled, 10 seconds, fleet-wide | active, risk-reducing, unproven |
+
+Priority ranking uses live history inside Guard. A magic missing from the published list fail-opens. That is not a license to treat an unranked magic as vetted.
+
+## Candidate classifications that are not "active"
+
+| Item | Class | Why |
+| --- | --- | --- |
+| V2 bundle | blocked | `DonchianExitPeriod=1` with `UseDonchianExit=true` is not a legal bot4 period (8, 10, 14). |
+| V2 bot4 file | blocked | Value kept at 1 so `OnInit` fails closed. |
+| Every V2 `.set` | unproven | Source behavior changed. `PENDING_REVALIDATION`. |
+| 54325, 54326, 220202 distance edits | unproven | Semantic repairs. Mandatory combined A/B. Not economically validated. |
+| 54510 and 54511 BOM cleanup | unproven | Potential lot-sizing change until live deal volumes show `LotType=1` was loaded. Mandatory revalidation. |
+| `MagicBot4_v50` / 60001 | disabled | Not in this source's inputs and not in either pool. |
+
+## What this page does not say
+
+It does not say the fleet is profitable, that a profit factor in a file comment still holds, or that a gate which blocks entries is a net benefit. It does not say the V2 candidate is safe to attach. Deployment automation must use `python tests/check_config_sets.py --require-deployable`, which fails while the Donchian blocker exists.
