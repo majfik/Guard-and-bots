@@ -1,0 +1,40 @@
+# Changelog
+
+## UNRELEASED — not deployed
+
+This source tree is not a release and is not attached to a live chart from these files. `VALIDATED_LIVE_CONFIGS/` is the untouched historical baseline. `VALIDATED_LIVE_CONFIGS_V2/` is a blocked candidate. Static Python checks can pass. `python tests/check_config_sets.py --require-deployable` fails because bot4 `DonchianExitPeriod=1`. MetaEditor compilation of this source has been run: all six experts, 0 errors and 0 warnings. That compile is not deployment readiness. MT5 runtime and Strategy Tester tests have not been run. No profitability claim.
+
+### Code
+
+- Symbol-scoped Guard heartbeat and publish sequence. Readers require a coherent even sequence and a fresh heartbeat. Missing or torn state fail-opens.
+- `BLOCK_NEW` is consumed on every entry send in all five trading EAs. `FLAT_REQ` is not an entry input.
+- Close results are none, partial, full, or pending, with a remainder plan and a pending-close registry that cancels a stuck close once after 30 seconds.
+- Market-deal filling follows execution mode. Closes do not hardcode `ORDER_FILLING_IOC`.
+- Hedging account required in every `OnInit`.
+- Staged-exit `OnInit` rejects `TP2 <= TP1` in point mode and does not rewrite the inputs.
+- Loss cooldown arms once per position id, on lifecycle net below `-LossCooldownMinNetLossUsd`.
+- Profit-target latch and floor-reason attribution. Disabled hard/daily flatten flags do not mask an enabled profit flatten.
+- Guard pools are dynamic. 54322, 40001, and 54340 are in both pools. `MagicBot4_v50` (60001) is not a Guard input.
+- bot4 rejects `DonchianExitPeriod` other than 8, 10, or 14 when `UseDonchianExit` is true.
+- Four locals in `BossafxGuardGate.mqh` that shadowed a global `order` were renamed to `closeOrder`. Two Guard input descriptions were shortened. No thresholds, distances, or lot inputs changed. The safety checker looks for `OrderSelect(closeOrder)` and `HistoryOrderSelect(closeOrder)`.
+- A full close resolves a working partial, including the TTL cancel, and does not claim that partial fill. TP1 and TP2 partial callers stay isolated.
+- `TRADE_RETCODE_TIMEOUT` and `TRADE_RETCODE_CONNECTION` are observed for 30 seconds before another close. They do not take an immediate `CTrade` fallback.
+- Guard `OnInit` publishes veto `107` `STARTUP` with `BLOCK_NEW` 1. The first tick replaces it. A stale Guard still fail-opens.
+- test4 keeps one stage per ticket, prunes only a confirmed full close, and restores `T4STG_<login>_<symbol>_<identifier>` after restart. No TP1/TP2 threshold changed. Magic 54340 needs mandatory revalidation.
+- bot4 still uses the same `MaxOpenPyramids`, `MaxSameDirectionPyramids`, and `GlobalEquityStopPct` inputs. Those checks now include magic 40001. Feature-on/off A/B is mandatory. No set threshold changed.
+
+### Config
+
+- Historical `.set` files were not modified. Their sha256 values are pinned in `tests/historical_baseline_sha256.json`.
+- V2 copies exist, marked not deployed. Bundle status `BLOCKED_PENDING_RUNTIME_CONFIRMATION`.
+- Stage repairs in V2 only: 54326 uses 600 then 601; 54325 uses a 20% close at 900 and a 70% close at 1200; 220202 uses a 20% close at 500 and a 70% close at 1200, which newly activates `UseStagedBE` at 500. All three need a combined A/B.
+- 54510 and 54511 V2 files drop embedded U+FEFF on `LotType`. That is a potential sizing change until live volumes show `LotType=1` was loaded.
+- V2 Guard set names `MagicTest4_v52=54340`, removes `MagicBot4_v50`, and writes the cooldown threshold inputs. Profit flatten remains on at 1000 USD. Cooldown remains 360 minutes.
+- bot4 V2 keeps `DonchianExitPeriod=1`.
+
+### Docs
+
+- [ARCHITECTURE.md](ARCHITECTURE.md), [GUARD_FEATURES.md](GUARD_FEATURES.md), and the root [README.md](../README.md) rewritten to the current source and candidate status.
+- Added [GLOBALVARIABLE_CONTRACT.md](GLOBALVARIABLE_CONTRACT.md), [CONFIGURATION_MATRIX.md](CONFIGURATION_MATRIX.md), [TEST_PLAN.md](TEST_PLAN.md), and this changelog.
+- Removed the stale claims that profit-target flatten is off, that the live cooldown is 120 minutes, and that 54322 and 40001 are outside the flatten pool.
+- Added [tests/compile_all.ps1](../tests/compile_all.ps1). It compiles all six experts in an isolated include tree and deletes generated `*.ex5` files. Re-run it after every source edit. A clean compile does not clear the Donchian block. The command is in the root [README.md](../README.md) check list and in [TEST_PLAN.md](TEST_PLAN.md).
