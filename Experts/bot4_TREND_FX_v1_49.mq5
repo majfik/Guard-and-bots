@@ -749,10 +749,37 @@ double LOT_LADDER[4];  // filled in OnInit from inputs
 int    g_max_pyramid_levels_effective = 4;
 
 //+------------------------------------------------------------------+
+//| GlobalVariable names. Account login is always part of the key so |
+//| two accounts in one terminal do not share state. Symbol is added |
+//| only for per-chart state. The daily anchor and the correlation    |
+//| group count stay account-wide on purpose (they are portfolio      |
+//| figures). OnInit copies an old B4_* key into the new name only    |
+//| when the new key is absent, so a deploy does not grant a fresh    |
+//| daily allowance or clear an overall-stop latch.                   |
+//+------------------------------------------------------------------+
+string B4AccountTag() {
+   return IntegerToString((long)AccountInfoInteger(ACCOUNT_LOGIN));
+}
+string B4AccountGv(const string key) {
+   return "B4A_" + B4AccountTag() + "_" + key;
+}
+string B4SymbolGv(const string key) {
+   return "B4A_" + B4AccountTag() + "_" + _Symbol + "_" + key;
+}
+
+// Documented in the file header. 60001-60099 was a stale v50 range: no EA in
+// this tree trades it, and the Guard does not put that magic in the gate pool.
+#define B4_MAGIC_LO 40001
+#define B4_MAGIC_HI 40099
+bool B4MagicInRange(const long magic) {
+   return (magic >= B4_MAGIC_LO && magic <= B4_MAGIC_HI);
+}
+
+//+------------------------------------------------------------------+
 //| OVERALL LOSS PERSISTENCE (GlobalVariable key, survives restart)  |
 //+------------------------------------------------------------------+
 string B4_OVERALL_HIT_VAR() {
-   return "B4_OVERALL_HIT_" + _Symbol + "_" + IntegerToString(MagicNumber);
+   return B4SymbolGv("OVERALL_HIT_" + IntegerToString(MagicNumber));
 }
 
 //+------------------------------------------------------------------+
@@ -926,7 +953,7 @@ int GetTotalOpenUnits() {
    for(int i = PositionsTotal()-1; i >= 0; i--) {
       if(!position.SelectByIndex(i)) continue;
       long magic = position.Magic();
-      if(magic >= 60001 && magic <= 60099) cnt++;
+      if(B4MagicInRange(magic)) cnt++;
    }
    return cnt;
 }
@@ -940,7 +967,7 @@ int GetTotalOpenPyramids() {
    for(int i = PositionsTotal()-1; i >= 0; i--) {
       if(!position.SelectByIndex(i)) continue;
       long magic = position.Magic();
-      if(magic < 60001 || magic > 60099) continue;
+      if(!B4MagicInRange(magic)) continue;
       string sym = position.Symbol();
       // Check if this symbol already counted
       bool found = false;
@@ -967,7 +994,7 @@ int GetPyramidsForSymbol() {
 
 //+------------------------------------------------------------------+
 //| COUNT SAME-DIRECTION PYRAMIDS (Fix #2)                           |
-//| Counts all Bot4 pyramids (magic 60001-60099) across ALL symbols  |
+//| Counts bot4 pyramids (magic 40001-40099) across ALL symbols       |
 //| in the same direction as 'dir'. Used to enforce the correlated-   |
 //| direction cap (MaxSameDirectionPyramids).                         |
 //+------------------------------------------------------------------+
@@ -976,7 +1003,7 @@ int GetSameDirectionPyramidCount(int dir) {
    for(int i = PositionsTotal()-1; i >= 0; i--) {
       if(!position.SelectByIndex(i)) continue;
       long magic = position.Magic();
-      if(magic < 60001 || magic > 60099) continue;
+      if(!B4MagicInRange(magic)) continue;
       int pos_dir = (position.PositionType() == POSITION_TYPE_BUY) ? 1 : -1;
       if(pos_dir == dir) cnt++;
    }
@@ -985,10 +1012,10 @@ int GetSameDirectionPyramidCount(int dir) {
 
 // Store group in GlobalVariable for cross-chart correlation
 void RegisterGroupVar() {
-   string gv = "B4_GRP_" + _Symbol;
+   string gv = B4SymbolGv("GRP");
    GlobalVariableSet(gv, 1.0);
    // Store direction
-   string dv = "B4_DIR_" + _Symbol;
+   string dv = B4SymbolGv("DIR");
    if(g_pyr.active_levels > 0)
       GlobalVariableSet(dv, (double)g_pyr.direction);
 }
@@ -1007,7 +1034,43 @@ void RegisterGroupVar() {
 // still leads to a real CloseBasket() call eventually), but a terminal
 // crash between an open and its close could leave the counter stuck high
 // until manually reset. Not bulletproof; flagged, not silently assumed safe.
-string GroupCountVarName(string grp) { return "B4_GROUPCOUNT_" + grp; }
+string GroupCountVarName(string grp) { return B4AccountGv("GROUPCOUNT_" + grp); }
+
+// Copy one legacy key onto the new name only when the new name is absent.
+bool B4CopyIfAbsent(const string neu, const string oldName) {
+   if(GlobalVariableCheck(neu)) return false;
+   if(!GlobalVariableCheck(oldName)) return false;
+   GlobalVariableSet(neu, GlobalVariableGet(oldName));
+   Print("[B4-MIGRATE] ", oldName, " -> ", neu, " value=", DoubleToString(GlobalVariableGet(neu), 2));
+   return true;
+}
+
+// One-time move of the pre-namespace B4_* variables. Same-day DAY_BALANCE
+// and DAILY_STOP are copied together with DAY_START so this chart does not
+// treat the current balance as a fresh daily anchor.
+void B4MigrateLegacyState() {
+   B4CopyIfAbsent(B4_OVERALL_HIT_VAR(), "B4_OVERALL_HIT_" + _Symbol + "_" + IntegerToString(MagicNumber));
+   B4CopyIfAbsent(B4SymbolGv("COOL_SL"), "B4_COOL_SL_" + _Symbol);
+   B4CopyIfAbsent(B4SymbolGv("COOL_TP"), "B4_COOL_TP_" + _Symbol);
+   B4CopyIfAbsent(B4SymbolGv("GRP"), "B4_GRP_" + _Symbol);
+   B4CopyIfAbsent(B4SymbolGv("DIR"), "B4_DIR_" + _Symbol);
+   B4CopyIfAbsent(GroupCountVarName(CorrelationGroup), "B4_GROUPCOUNT_" + CorrelationGroup);
+
+   string newDay = B4AccountGv("DAY_START");
+   if(!GlobalVariableCheck(newDay) && GlobalVariableCheck("B4_DAY_START")) {
+      MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
+      datetime today = (datetime)(TimeCurrent() - dt.hour*3600 - dt.min*60 - dt.sec);
+      datetime stored = (datetime)GlobalVariableGet("B4_DAY_START");
+      if(stored == today) {
+         GlobalVariableSet(newDay, (double)stored);
+         B4CopyIfAbsent(B4AccountGv("DAY_BALANCE"), "B4_DAY_BALANCE");
+         B4CopyIfAbsent(B4AccountGv("DAILY_STOP"), "B4_DAILY_STOP");
+         Print("[B4-MIGRATE] same-day daily anchor preserved");
+      } else {
+         Print("[B4-MIGRATE] legacy DAY_START is not today; daily anchor not copied");
+      }
+   }
+}
 int GetGroupPyramidCountForGroup(string grp) {
    string gv = GroupCountVarName(grp);
    return GlobalVariableCheck(gv) ? (int)GlobalVariableGet(gv) : 0;
@@ -1967,12 +2030,14 @@ double GetBasketRMultiple() {
    return GetBasketPnL() / g_pyr.initial_risk_r;
 }
 double GetTotalFloatingPnL() {
+   // Strategy-wide equity breaker: every bot4 magic in the documented
+   // 40001..40099 range, on every symbol. "Global" here means the bot4
+   // fleet, not this chart alone.
    double total = 0;
    for(int i = PositionsTotal()-1; i >= 0; i--) {
       if(!position.SelectByIndex(i)) continue;
-      long magic = position.Magic();
-      if(magic >= 60001 && magic <= 60099)
-         total += position.Profit() + position.Swap();
+      if(!B4MagicInRange(position.Magic())) continue;
+      total += position.Profit() + position.Swap();
    }
    return total;
 }
@@ -2199,6 +2264,13 @@ bool OpenPyramidLevel(int level_idx, int direction, string basket_id) {
       }
    }
 
+   // Every pyramid send, including L2+ additions, stops here when Guard
+   // has published a fresh BLOCK_NEW. The L1 caller also checks, so a
+   // blocked first entry never builds a basket; this is the choke point
+   // the add path actually reaches.
+   if(GGate_EntryBlocked(MagicNumber, "pyramid"))
+      return false;
+
    // ── Send order with broker-side SL ───────────────────────────
    bool ok = false;
    int  max_retries = 3;
@@ -2304,13 +2376,21 @@ void CloseBasket(string reason) {
          g_pyr.level[i].ticket = 0;
          continue;
       }
-      bool closed = GGate_CloseTagged(trade, g_pyr.level[i].ticket, Bot4GateReasonFromCloseReason(reason));
-      if(closed) {
+      ulong  cb_deal   = 0;
+      double cb_filled = 0;
+      int cb_outcome = GGate_CloseTaggedEx(trade, g_pyr.level[i].ticket, Bot4GateReasonFromCloseReason(reason), cb_deal, cb_filled);
+      ulong cb_ticket = g_pyr.level[i].ticket;
+      if(cb_outcome == GGATE_CLOSE_FULL && !position.SelectByTicket(cb_ticket)) {
+         GGate_PartialPlanClear(cb_ticket, 1);
          g_pyr.level[i].ticket = 0;
       } else {
+         // FULL that still selects means volume remains (an earlier partial
+         // must not be treated as the position being gone). PARTIAL and
+         // PENDING keep the slot so the remainder is retried.
          close_failures++;
-         Print(StringFormat("[CLOSE_BASKET] L%d close FAILED rc=%d (%s) — keeping tracking",
-               i+1, trade.ResultRetcode(), trade.ResultRetcodeDescription()));
+         Print(StringFormat("[CLOSE_BASKET] L%d close %s filled=%.2f deal=%I64u rc=%u — keeping tracking",
+               i+1, GGate_CloseOutcomeText(cb_outcome), cb_filled, cb_deal,
+               GGate_LastCloseRetcode()));
       }
    }
    if(close_failures > 0) {
@@ -2364,12 +2444,12 @@ void CloseBasket(string reason) {
 
    if(is_loss_like_close) {
       g_cooldown_sl_time = TimeCurrent();
-      GlobalVariableSet("B4_COOL_SL_" + _Symbol, (double)g_cooldown_sl_time);
+      GlobalVariableSet(B4SymbolGv("COOL_SL"), (double)g_cooldown_sl_time);
       recentStreak = (recentStreak > 0) ? -1 : recentStreak - 1;
       recentResults = StringSubstr(recentResults+"L", 0, 8);
    } else if(is_win_like_close) {
       g_cooldown_tp_time = TimeCurrent();
-      GlobalVariableSet("B4_COOL_TP_" + _Symbol, (double)g_cooldown_tp_time);
+      GlobalVariableSet(B4SymbolGv("COOL_TP"), (double)g_cooldown_tp_time);
       recentStreak = (recentStreak < 0) ? 1 : recentStreak + 1;
       recentResults = StringSubstr(recentResults+"W", 0, 8);
    } else if(reason != "FRIDAY_CLOSE") {
@@ -2405,21 +2485,31 @@ void PartialCloseBasket(double pct) {
       double min_lot    = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
       if(close_lot < min_lot) close_lot = min_lot;
       if(close_lot >= vol_before) close_lot = NormalizeVolume(vol_before * 0.5);
+      // An earlier attempt that partially filled or is still pending owns the
+      // amount: send only its unfilled remainder, not a fresh pct of the smaller lot.
+      close_lot = GGate_PartialPlanVolume(g_pyr.level[i].ticket, 1, close_lot);
       if(close_lot < min_lot) {
          Print(StringFormat("[PARTIAL_CLOSE] L%d skip: lot too small (vol=%.2f)",
                i+1, vol_before));
          break;
       }
 
-      bool pc_ok = GGate_ClosePartialTagged(trade, g_pyr.level[i].ticket, close_lot, GGATE_REASON_TP1);
-      if(pc_ok) {
+      ulong  pc_deal   = 0;
+      double pc_filled = 0;
+      int pc_outcome = GGate_ClosePartialTaggedEx(trade, g_pyr.level[i].ticket, close_lot, GGATE_REASON_TP1, pc_deal, pc_filled, "", 1);
+      bool pc_done = GGate_PartialPlanApply(g_pyr.level[i].ticket, 1, close_lot, pc_outcome, pc_filled);
+      if(pc_done) {
          g_pyr.level[i].partial_closed = true;
-         Print(StringFormat("[PARTIAL_CLOSE] L%d ticket=%d closed=%.2f (%.0f%% of %.2f)",
-               i+1, g_pyr.level[i].ticket, close_lot, pct*100, vol_before));
+         Print(StringFormat("[PARTIAL_CLOSE] L%d ticket=%d closed=%.2f of planned %.2f (%.0f%% of %.2f) deal=%I64u",
+               i+1, g_pyr.level[i].ticket, pc_filled, close_lot, pct*100, vol_before, pc_deal));
       } else {
-         Print(StringFormat("[PARTIAL_CLOSE] L%d FAILED rc=%d — will retry next trigger",
-               i+1, trade.ResultRetcode()));
-         return;  // don't set partial_done if the close failed
+         if(pc_outcome == GGATE_CLOSE_PARTIAL)
+            Print(StringFormat("[PARTIAL_CLOSE] L%d PARTIAL fill %.2f of %.2f deal=%I64u — still owed %.2f, retried next trigger",
+                  i+1, pc_filled, close_lot, pc_deal, GGate_PartialPlanVolume(g_pyr.level[i].ticket, 1, close_lot)));
+         else
+            Print(StringFormat("[PARTIAL_CLOSE] L%d %s rc=%u — will retry next trigger",
+                  i+1, GGate_CloseOutcomeText(pc_outcome), GGate_LastCloseRetcode()));
+         return;  // don't set partial_done until the intended amount is fully closed
       }
       break; // close only L1 first
    }
@@ -2545,8 +2635,8 @@ void UpdateDailyStats() {
    // the WHOLE account — not per-symbol, not from EA-start equity.
    // The first chart to see the new broker day sets the shared anchor;
    // all other charts read the same value.
-   string gv_day    = "B4_DAY_START";       // datetime of current broker day
-   string gv_balava = "B4_DAY_BALANCE";     // account balance at day start
+   string gv_day    = B4AccountGv("DAY_START");    // datetime of current broker day
+   string gv_balava = B4AccountGv("DAY_BALANCE");  // account balance at day start
 
    double stored_day = GlobalVariableCheck(gv_day) ? GlobalVariableGet(gv_day) : 0;
    if((datetime)stored_day != today) {
@@ -2554,7 +2644,7 @@ void UpdateDailyStats() {
       GlobalVariableSet(gv_day, (double)today);
       GlobalVariableSet(gv_balava, AccountInfoDouble(ACCOUNT_BALANCE));
       // Reset the shared daily-stop flag for the new day
-      GlobalVariableSet("B4_DAILY_STOP", 0.0);
+      GlobalVariableSet(B4AccountGv("DAILY_STOP"), 0.0);
       Print("[DAY] New broker day. Account balance anchor=",
             AccountInfoDouble(ACCOUNT_BALANCE));
    }
@@ -2573,12 +2663,12 @@ bool IsDailyLossLimitReached() {
    if(MaxDailyLossAmount <= 0) return false;
 
    // BUG F FIX: portfolio-wide. Check shared flag first (set by any chart).
-   if(GlobalVariableCheck("B4_DAILY_STOP") && GlobalVariableGet("B4_DAILY_STOP") > 0.5)
+   if(GlobalVariableCheck(B4AccountGv("DAILY_STOP")) && GlobalVariableGet(B4AccountGv("DAILY_STOP")) > 0.5)
       return true;
 
    // Day-start balance is the shared anchor (broker midnight, whole account)
-   double day_start_bal = GlobalVariableCheck("B4_DAY_BALANCE") ?
-                          GlobalVariableGet("B4_DAY_BALANCE") :
+   double day_start_bal = GlobalVariableCheck(B4AccountGv("DAY_BALANCE")) ?
+                          GlobalVariableGet(B4AccountGv("DAY_BALANCE")) :
                           AccountInfoDouble(ACCOUNT_BALANCE);
    double eq = AccountInfoDouble(ACCOUNT_EQUITY);
 
@@ -2605,7 +2695,7 @@ bool IsDailyLossLimitReached() {
    // FTMO daily loss = (day_start_balance - current_equity) across whole account
    bool hit = (day_start_bal - eq) >= (effective_daily_limit - SafetyBuffer);
    if(hit) {
-      GlobalVariableSet("B4_DAILY_STOP", 1.0);  // broadcast to all charts
+      GlobalVariableSet(B4AccountGv("DAILY_STOP"), 1.0);  // broadcast to all charts on this account
       Print("[FTMO-DAILY] Portfolio daily loss limit hit: day_start_bal=",
             day_start_bal, " equity=", eq,
             " loss=", day_start_bal - eq, " limit=", effective_daily_limit,
@@ -3955,7 +4045,26 @@ void ScanHistoricalD1Breakout() {
 //+------------------------------------------------------------------+
 //| OnInit                                                           |
 //+------------------------------------------------------------------+
+// Legal Donchian exit lengths are the enumerators only. A .set can store an
+// integer that is not one of them; UseDonchianExit would then size the H1
+// channel from that integer. Static review cannot tell which length was
+// effective live, so an illegal value refuses to start instead of guessing.
+bool Bot4DonchianExitPeriodLegal() {
+   int period = (int)DonchianExitPeriod;
+   return (period == H1_EXIT_8 || period == H1_EXIT_10 || period == H1_EXIT_14);
+}
+
 int OnInit() {
+   if(!GGate_RequireHedgingAccount())
+      return INIT_FAILED;
+   if(UseDonchianExit && !Bot4DonchianExitPeriodLegal()) {
+      Print("[BOT4] INIT FAILED: DonchianExitPeriod=", (int)DonchianExitPeriod,
+            " is not a legal ENUM_H1_EXIT_PERIOD (8, 10, 14) while UseDonchianExit is true. ",
+            "Value left unchanged. Confirm the effective live period and rerun backtests before deploying.");
+      return INIT_FAILED;
+   }
+   B4MigrateLegacyState();
+
    // ── InitialBalance sanity check (2026-06-30) ─────────────────────────
    // BUG FOUND: InitialBalance is the reference point for the overall-loss
    // circuit breaker (IsOverallLossLimitReached: hit when
@@ -4130,8 +4239,8 @@ int OnInit() {
    // silently let a new L1 open with no gate ever blocking it (confirmed
    // via CSV: 2026-07-20 21:02:39 open, only 1h35m after a 19:27:33 SL,
    // inside what should have been a 12h window).
-   string coolSlGV = "B4_COOL_SL_" + _Symbol;
-   string coolTpGV = "B4_COOL_TP_" + _Symbol;
+   string coolSlGV = B4SymbolGv("COOL_SL");
+   string coolTpGV = B4SymbolGv("COOL_TP");
    if(GlobalVariableCheck(coolSlGV)) {
       g_cooldown_sl_time = (datetime)GlobalVariableGet(coolSlGV);
       int barsSinceRestore = (int)((TimeCurrent() - g_cooldown_sl_time) / PeriodSeconds(_Period));
@@ -4779,8 +4888,8 @@ void OnTick() {
       return;  // no new entries while daily stop active
    }
    // Per-chart soft % stop (uses shared day-start balance as anchor)
-   double day_start_bal = GlobalVariableCheck("B4_DAY_BALANCE") ?
-                          GlobalVariableGet("B4_DAY_BALANCE") :
+   double day_start_bal = GlobalVariableCheck(B4AccountGv("DAY_BALANCE")) ?
+                          GlobalVariableGet(B4AccountGv("DAY_BALANCE")) :
                           dailyStartEquity;
    if(DailyEquityStopPct > 0 && day_start_bal > 0) {
       double drop = (day_start_bal - equity) / day_start_bal * 100.0;
@@ -5272,6 +5381,14 @@ void OnTick() {
    // reading its once-per-tick snapshot before anyone's open registers).
    if(!GGate_FleetOpenCooldownOk()) {
       Print("[GATE] MN:", MagicNumber, " new basket skipped -- within fleet-wide same-instant open cooldown");
+      ZeroMemory(g_pyr);
+      return;
+   }
+
+   // Final pre-order gate for a new L1 basket. Pyramid additions are gated
+   // again inside OpenPyramidLevel. Missing or stale Guard state fail-opens.
+   // FLAT_REQ is not read.
+   if(GGate_EntryBlocked(MagicNumber, "basket")) {
       ZeroMemory(g_pyr);
       return;
    }
