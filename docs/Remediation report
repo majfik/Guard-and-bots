@@ -1,0 +1,47 @@
+# Remediation report
+
+F1–F12 are the twelve source-safety findings covered, in order, by `required` in [tests/check_guard_safety.py](../tests/check_guard_safety.py). Review follow-ups are the later pool, bookkeeping, and configuration corrections. Static checks have passed. MetaEditor compilation of this source has been run (`tests/compile_all.ps1`): all six experts, 0 errors and 0 warnings. MT5 runtime tests have not been run. A clean compile is not deployment readiness. Nothing is deployed. No profitability claim. The V2 bundle stays `BLOCKED_PENDING_RUNTIME_CONFIRMATION` because `DonchianExitPeriod=1`.
+
+| ID | Finding | Implementation | Test | Status | Still required |
+| --- | --- | --- | --- | --- | --- |
+| F1 | Close sends must not hardcode `ORDER_FILLING_IOC`. Filling follows execution mode and `SYMBOL_FILLING_*` bits. | `GGate_MarketDealFilling` in [BossafxGuardGate.mqh](../Include/BossafxGuardGate.mqh). `PgCloseMagic` and `GGuardCloseDirectionTagged` call `GGate_CloseVolumeCore`. | `check_filling` | Static pass. Compiled 0 errors, 0 warnings. | One close on the broker's execution mode. |
+| F2 | Close results are none, partial, full, or pending. A partial must retry the remainder, not a new percentage. | `GGATE_CLOSE_*`, `GGate_PartialPlanVolume`, `GGate_PartialPlanApply`. | `check_outcomes` | Static pass | Tester partial fill. |
+| F3 | A working close must not be duplicated. | Pending registry in the gate header. | `check_pending` | Static pass | Tester order left in `PLACED`. |
+| F4 | Profit flatten must attribute `PROFIT_TARGET` and latch without a disabled floor masking it. | `ComputeFlattenReason`, `MaybeFlattenProfitTarget`, `ClearStaleFloorEpisodeReason`. | `check_profit_target` | Static pass | Tester at `ProfitTargetUsd=1000` with hard flatten off. |
+| F5 | Liveness is the symbol heartbeat, not the M30 rank stamp. Priority publish is uncapped; a count above 64 fail-opens. | `GGate_PublishHeartbeat`, `GGate_HeartbeatFresh`, `GGATE_PRIORITY_COUNT_SANITY_MAX`. | `check_heartbeat` | Static pass | Two-symbol terminal check that heartbeats do not cross. Priority keys are still terminal-wide. |
+| F6 | Hedging account only. | `GGate_RequireHedgingAccount` at the start of all six `OnInit` functions. | `check_hedging` | Static pass | Netting account must `INIT_FAILED`. |
+| F7 | Every entry send consumes `BLOCK_NEW`. Trading EAs do not read `FLAT_REQ`. | `GGate_ReadEntryBlock`, `GGate_EntryBlocked`, call sites in all five trading EAs. | `check_entry_block` (sites 4/4/4/2/2) | Static pass | Journal: `[GGATE-BLOCK]` when `BLOCK_NEW` is 1; fail-open when the heartbeat is missing. |
+| F8 | Regime 2.2 must use the tagged close helpers. | [bot1_regime2.2.mq5](../Experts/bot1_regime2.2.mq5) has no direct `PositionClose`. | `check_regime22_helpers` | Static pass | Deal comment on a 2.2 close. |
+| F9 | Illegal staged distances fail `OnInit` and are not rewritten. | `GGate_ValidateStageConfig`. | `check_stage_validation` | Static pass. Historical 54325, 54326, and 220202 print `KNOWN_HISTORICAL_INVALID`. | Those three historical files must `INIT_FAILED` on this source. |
+| F10 | Cooldown arms once, on full-close lifecycle net below `-LossCooldownMinNetLossUsd`, not on a scratch. | `MegProcessCooldownQueue`, `MEG_CDMARK_*`. | `check_cooldown` | Static pass | One losing close and one scratch. Window is 360 minutes in the sets, not the source default 120. |
+| F11 | A pending close older than 30 seconds is cancelled once, not resent while it lives. | `GGATE_PENDING_CLOSE_TTL_SEC`. | `check_pending_timeout` | Static pass | Tester timeout. |
+| F12 | bot4 floating P&L is strategy-wide, and legacy GlobalVariables migrate only if the symbol key is absent. | bot4 scope helpers and `GGate_MigrateLegacyGv`. | `check_bot4_scope` | Static pass | Restart with an old unsuffixed heartbeat present and a symbol key already set; the symbol key must stay. |
+
+## Review follow-ups
+
+| Follow-up | Implementation | Test | Status | Still required |
+| --- | --- | --- | --- | --- |
+| Close magic is restored; floor reasons do not stick; bot1 books a finished close once. | Guard close helper and bot1 finalization. | `check_close_bookkeeping` | Static pass | Runtime magic on the next order after a flatten. |
+| Pools are dynamic and include 54322, 40001, and 54340. 60001 is not an input. | `MegAddActiveMagic` / `MegPoolAdd` in the Guard. `PG_MAGIC_T` 60001 remains an unused `#define`. | `check_magic_pools` | Static pass | `OnInit` log of both pool sizes on a hedging account. |
+| V2 candidate, not a silent retune. | [VALIDATED_LIVE_CONFIGS_V2](../VALIDATED_LIVE_CONFIGS_V2), [check_config_sets.py](../tests/check_config_sets.py). | `check_configs` | Static pass. `--require-deployable` fails. | Do not attach V2. |
+| Donchian period 1 is illegal and must not be guessed. | `Bot4DonchianExitPeriodLegal` before `B4MigrateLegacyState`. Value left at 1. Bundle `BLOCKED_PENDING_RUNTIME_CONFIRMATION`. | Config checker `UNRESOLVED_BLOCKER`; `--require-deployable` exit 1 | Static pass of the rejection. Deployment blocked. | Confirm the live effective period. Rerun backtests. Only then change the set. |
+| 54325 / 220202 are semantic repairs. Baseline TP1 does not run after TP2 sets stage=2. V2 adds a 20% close at the lower distance and a later 70% close. | V2 distances only. Historical files unchanged. | Config notes and `KNOWN_HISTORICAL_INVALID` | Not economically validated | Combined A/B. |
+| 54326 is a semantic repair from simultaneous 600/600 eligibility to 600 then 601. | V2 `TP2_Distance=601`. | Same | Not economically validated | Combined A/B. |
+| 220202 newly activates `UseStagedBE` at 500 points. | V2 distances; `UseStagedBE` was already true. | Note requires the move in the A/B | Not validated | A/B must show the stop move. |
+| 54510 / 54511 BOM cleanup may change lot sizing. | U+FEFF removed only in V2. | `KNOWN_HISTORICAL_BOM_KEY` on the historical files; V2 notes say potential economic change | Unproven | Live deal volumes versus `LotType=1` and versus `LOT_FIXED`. |
+| Historical bytes cannot be laundered by regenerating the manifest. | `tests/historical_baseline_sha256.json` plus `git diff` on `VALIDATED_LIVE_CONFIGS` when git is available. | Config checker | Static pass while the folder is clean | Any historical edit must fail even after `--write-manifest`. |
+| Docs claimed profit flatten was off and cooldown was 120. | [GUARD_FEATURES.md](GUARD_FEATURES.md) now records historical and V2: flatten on at 1000, cooldown 360. | This report | Doc correction | None in code. The set values were already 1000 and 360. |
+| A full close deadlocked on a working partial because intent mismatch returned before the TTL cancel. | `GGate_CloseVolumeCore` resolves a partial slot for a full caller, returns `PENDING` while it is working, and does not report that fill as the full caller's deal. TP1/TP2 partials stay isolated. | `check_full_over_partial` | Static pass | Tester: partial pending, then a full close, including the 30s cancel. |
+| `TIMEOUT` / connection took an immediate second close. | Ambiguous retcode records an observe slot. No `CTrade` fallback until volume, order, or deals prove the result, or 30s pass with volume unchanged. | `check_ambiguous_close` | Static pass | Tester timeout without a doubled close. |
+| Guard `OnInit` published OK before real state. | `Publish(MEG_VETO_STARTUP, MEG_VETO_OK)`. First `OnTick` replaces it. Stale Guard remains fail-open. | `check_startup_veto` | Static pass | Journal: `STARTUP` then the computed veto. Entries blocked only while that snapshot is fresh. |
+| test4 stage table overwrote slot 0 and forgot stage on restart, so TP1/TP2 could repeat. | Prune confirmed-closed tickets, refuse to overwrite an active slot, persist `T4STG_<login>_<symbol>_<identifier>`. | `check_test4_stages` | Static pass. Mandatory revalidation for 54340. | Restart with a completed TP1 and confirm it does not re-fire. |
+| bot4 magic range now applies `MaxOpenPyramids`, `MaxSameDirectionPyramids`, and `GlobalEquityStopPct` to 40001. | Existing bot4 checks. No set threshold was edited. | Config notes | Mandatory feature-on/off A/B and runtime tests. Not economically validated. | One run with each cap binding and one with it not binding. |
+
+## Remaining validation
+
+- MetaEditor compile of all six experts after these edits: 0 errors and 0 warnings. A clean compile does not clear `DonchianExitPeriod=1`. See [TEST_PLAN.md](TEST_PLAN.md).
+- Every MT5 row in [TEST_PLAN.md](TEST_PLAN.md): not run.
+- `--require-deployable`: fails, `DonchianExitPeriod=1`.
+- Three stage repairs and two BOM/sizing files: mandatory A/B or live-volume checks, not done.
+- All configs: revalidation required because the source changed.
+- No profitability claim.
