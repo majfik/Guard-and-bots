@@ -1,0 +1,84 @@
+# GlobalVariable contract
+
+MT5 `GlobalVariableSet` stores a double under a string name for the terminal. These keys have no API TTL. They remain until deleted or the terminal store is cleared. "Expiry" below is the check the reader applies. Types are the MQL5 values stored in that double.
+
+Symbol-scoped keys use the chart symbol of the writer. Trading EAs and the Guard must share that symbol. Terminal-wide keys are shared by every symbol on the terminal.
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the reader algorithm and the close state machine.
+
+## Symbol-scoped liveness
+
+| Key | Owner | Written | Unit | Reader rule |
+| --- | --- | --- | --- | --- |
+| `BOSSAFX_GuardHeartbeat_<symbol>` | Guard `GGate_PublishEnd` | `(double)TimeCurrent()` after the sequence is even | seconds, server time | Fresh when `TimeCurrent() - value <= staleSeconds`. Callers use 400. Missing, `<= 0`, or older than the window is not alive. |
+| `BOSSAFX_GuardPubSeq_<symbol>` | Guard `GGate_PublishBegin` / `GGate_PublishEnd` | integer sequence | count | Odd: publication in progress, snapshot torn. Even and `> 0`: last publication finished. Missing or `<= 0`: no snapshot. |
+
+Legacy unsuffixed `BOSSAFX_GuardHeartbeat` and `BOSSAFX_GuardPubSeq` are read once, and only if the symbol key is absent. They are not a second live channel.
+
+`GGate_PublishBegin` forces the sequence odd before `MEG_<symbol>_*` writes. `GGate_PublishEnd` forces it even and then writes the heartbeat. A fresh heartbeat means the even sequence for this symbol was stored first.
+
+## MEG snapshot (symbol-scoped)
+
+Prefix `MEG_<symbol>_`. Owner: Guard `Publish`, except the cooldown-until keys, which `MegProcessCooldownQueue` writes, and `GAP_BLOCK_UNTIL`, which the gap logic writes. Trading EAs must not write these.
+
+| Key | Unit | Meaning |
+| --- | --- | --- |
+| `VETO` | veto code | `0` OK, `101` HARD_FLOOR, `102` DAILY_FLOOR, `103` LOSS_COOLDOWN, `104` GAP_BLOCK, `105` FRIDAY, `106` PROFIT_TARGET, `107` STARTUP. `107` is the OnInit publication only. The first tick replaces it. It sets `BLOCK_NEW` and does not set `FLAT_REQ`. |
+| `BLOCK_NEW` | 0.0 or 1.0 | 1 when `VETO != 0`. Consumers block when the value is `>= 0.5` and the snapshot is coherent. |
+| `FLAT_REQ` | 0.0 or 1.0 | 1 when an enabled flatten reason is active. Not read by trading EAs. Not an entry gate. |
+| `HARD_FLOOR` | account-currency price level | `HardFloorLevel()` at publish time. Informational. The veto decision is separate. |
+| `DAILY_FLOOR` | account-currency price level | `DailySoftFloorLevel()` at publish time. 0 when the day-start balance is unknown. |
+| `TS` | `(double)TimeCurrent()` | Publish time. Not the liveness signal. Liveness is the symbol heartbeat. |
+| `LOSS_COOLDOWN_UNTIL` | datetime seconds | Blanket cooldown end. Compared with `TimeCurrent()`. |
+| `LOSS_COOLDOWN_UNTIL_BUY` | datetime seconds | Directional end used by `GGate_LossCooldownOk` for buy entries. |
+| `LOSS_COOLDOWN_UNTIL_SELL` | datetime seconds | Directional end for sell entries. |
+| `GAP_BLOCK_UNTIL` | datetime seconds | Gap-block end. |
+
+`MEG_CDMARK_<login>_<slot>` and `MEG_CDMARK_<login>_<slot>_NET`, plus `MEG_CDMARK_IDX_<login>`, are account-scoped marks (128 slots). They store a position id and its lifecycle net so that id is not armed twice. They are not symbol-scoped and they are not an entry gate.
+
+`T4STG_<login>_<symbol>_<position identifier>` is written by test4. The value is the stage integer. It is deleted only after that position is confirmed fully closed. It is not a Guard key.
+
+## Terminal-wide gate keys
+
+Owner is Guard unless noted. A second symbol on the same terminal shares these keys.
+
+| Key | Owner | Unit | Freshness |
+| --- | --- | --- | --- |
+| `BOSSAFX_GuardBarGate_BarTime` | Guard, when it publishes the ranking | `(double)TimeCurrent()` at rank publish | Not liveness. Do not treat it as the heartbeat. |
+| `BOSSAFX_GuardPriority_Count` | Guard | integer count of ranked magics | `<= 0` or `> 64` fail-opens `GGate_ShouldOpen`. Guard writes 0 when the bar gate is off. |
+| `BOSSAFX_GuardPriority_<i>` | Guard | magic number at rank `i` starting at 0 | Valid for the whole `GateTimeframe` bar. Higher index is lower priority. |
+| `BOSSAFX_GuardSignal_<magic>` | The trading EA in `GGate_PublishSignal` | M5 bar open time (`iTime(symbol, PERIOD_M5, 0)`) | "This magic signaled this bar" when the value equals the current M5 open time. |
+| `BOSSAFX_GuardDistGate_Enabled` | Guard | 1.0 or 0.0, mirrors `UsePriceDistanceGate` | Missing or `< 0.5`: distance check allows. |
+| `BOSSAFX_GuardDistGate_MinPoints` | Guard | points, `MinReentryDistancePoints` | Used only when the gate is enabled and the heartbeat is fresh. |
+| `BOSSAFX_GuardDistGate_LastPrice` | Guard | price of the last fleet entry | Incomplete publish fail-opens. |
+| `BOSSAFX_GuardDistGate_LastTime` | Guard | open time of that entry | Stale heartbeat fail-opens even if this time is recent. |
+| `BOSSAFX_GuardCooldownGate_Enabled` | Guard | 1.0 or 0.0, mirrors `UseLossCooldownGate` | Missing or `< 0.5`: directional check allows. Does not change `BLOCK_NEW`. |
+| `BOSSAFX_GuardFleetOpenGate_Enabled` | Guard | 1.0 or 0.0, mirrors `UseFleetOpenCooldownGate` | Missing or `< 0.5`: pile-on check allows. |
+| `BOSSAFX_GuardFleetOpenGate_Seconds` | Guard | seconds, `FleetOpenCooldownSeconds` | Read with the timestamp. Sets use 10. |
+| `BOSSAFX_GuardFleetOpenGate_LastOpenTime` | The trading EA that just opened, via `GGate_StampFleetOpen` | `(double)TimeCurrent()` | Block while `TimeCurrent() - value` is inside the published seconds. |
+
+## Coherent BLOCK_NEW read
+
+`GGate_ReadEntryBlock` for this symbol:
+
+1. Even publish sequence.
+2. Heartbeat fresh (400 seconds unless the caller passes another window).
+3. Read `MEG_<symbol>_BLOCK_NEW` and `MEG_<symbol>_VETO` only.
+4. Same even sequence again.
+5. Heartbeat still fresh.
+
+`GGate_GuardEntryAllowed` repeats that once. Failure allows the order (`FAIL_OPEN_STALE_HEARTBEAT` or `FAIL_OPEN_TORN_OR_MISSING`). Success with `BLOCK_NEW >= 0.5` refuses it. `FLAT_REQ` is never part of this read.
+
+## In-memory timers (not GlobalVariables)
+
+Lost on EA reload. Listed so they are not confused with the keys above.
+
+| Name | Where | Limit |
+| --- | --- | --- |
+| Pending close slot | `BossafxGuardGate.mqh` | Cancel the working close once after 30 seconds. The slot remains until the order is gone. |
+| Profit latch | Guard | 3600 seconds, then the latch releases even if a leg is still open. |
+| Basket and profit pending-order tables | Guard | 86400 seconds. |
+
+## bot4 keys
+
+bot4 keeps its own symbol-scoped and account-scoped variables (`B4SymbolGv`, `B4AccountGv`) for pyramid state and its daily stop. Those are not Guard keys and are not read by the other EAs. `DonchianExitPeriod` is an input, not a GlobalVariable.
