@@ -1,0 +1,128 @@
+# Runbook: compile and backtest the Guard fleet with BOSSAFX 5 (for another agent)
+Audience: an AI agent (or engineer) on a different PC who must compile the EAs and run Strategy Tester runs without any GUI clicking. Everything below was observed on the original machine on 2026-11-13. Items marked **UNVERIFIED** were not run there.
+## 1. What is installed (nothing custom on top of stock)
+| Item | Finding |
+| --- | --- |
+| Terminal | BOSSAFX 5, a MetaQuotes MT5 build, `terminal64.exe` 5.0.0.6182, in `C:\Program Files\BOSSAFX 5\` |
+| Executables there | `terminal64.exe`, `MetaEditor64.exe`, `metatester64.exe`, `uninstall.exe`. No plug-ins, no extra DLLs. |
+| Terminal data dir | `%APPDATA%\MetaQuotes\Terminal\D8D31ADAC622C3FE1912FE9E64CD2637` (hash is machine-specific; read it from the `origin.txt` that points at the install path) |
+| `MQL5\Libraries`, `MQL5\Indicators` | Only MetaQuotes examples and a stray `Kalkulator.ex5`. No third-party libraries. The EAs import no DLLs. |
+| `MQL5\Include` | The standard MetaQuotes library plus one stale copy of `PortfolioGuard.mqh` (dated 2026-09-07). `BossafxGuardGate.mqh` is NOT there. |
+| Python | 3.10.11 present, with no `MetaTrader5`, `pandas`, `numpy` or `pytest` package found. The `MetaTrader5` Python package is not used anywhere. |
+| MT5 "packets" / add-ons | None. No Wine layer, no tester farm, no cloud agents ("Cloud servers switched off" in the tester journal). Only the local tester agent runs. |
+| Broker account | Demo server `BOSSAFX-Demo`. A login is needed to download history. Get the credentials from the user. Never write them into the repo. |
+| Symbols with history | GOLD (2021-2026), EURUSD, USDPLN, US100, OILWTI. Tick folders exist for more. `GOLD_test` (used by some `.set` files) was NOT found on this terminal. |
+Consequence: to reproduce, you need a Windows machine with the BOSSAFX 5 terminal (or any MT5 build, since nothing BOSSAFX-specific is required by the code, only the broker's symbol names and history), the repo, and a logged-in demo account so history can sync.
+## 2. Hard constraints
+- MT5 is Windows only. A Linux or headless box cannot run the tester. **UNVERIFIED**: MT5 under Wine could work but was never tried.
+- The tester must run in an interactive Windows session. **UNVERIFIED**: an SSH-only or service session may fail to start `terminal64.exe`.
+- A first-time machine must log in once with a demo account so the terminal can download history. The tester cannot create history from nothing.
+- If you cannot run Windows tooling yourself, use the hand-off protocol in section 8.
+## 3. Repository headers must be on the include path
+The EAs include `BossafxGuardGate.mqh` and `PortfolioGuard.mqh` from the repo `Include\` folder. Do not rely on the terminal's `MQL5\Include`: it has a stale `PortfolioGuard.mqh` and lacks the gate header. The repo compiles through an isolated include tree. Use the repo script:
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tests/compile_all.ps1
+```
+It copies the terminal's standard `MQL5\Include` into `tests/build-mql5\Include`, overlays the repo headers, compiles every `Experts\*.mq5`, and deletes generated `.ex5`. Expected: `COMPILE SUMMARY  files=6 errors=0 warnings=0`.
+Single-file compile (used for the backtest below):
+```powershell
+$repo   = "<repo root>"
+$build  = "$repo\tests\build-mql5"           # must already exist (run compile_all.ps1 once)
+Copy-Item "$repo\Include\*.mqh" "$build\Include" -Force
+$log = "$env:TEMP\compile.log"
+$p = Start-Process "C:\Program Files\BOSSAFX 5\MetaEditor64.exe" `
+     -ArgumentList "/compile:`"$repo\Experts\bot4_TREND_FX_v1_49.mq5`" /inc:`"$build`" /log:`"$log`"" `
+     -PassThru -WindowStyle Hidden
+$p.WaitForExit(120000) | Out-Null
+```
+Gotchas:
+- **MetaEditor exits with code 1 even on success.** Judge by the `Result: 0 errors, 0 warnings` line in the log, never by the exit code.
+- The log is UTF-16 LE with a BOM. Read it as Unicode.
+- The `.ex5` is written beside the `.mq5`. `*.ex5` is gitignored. Do not commit it.
+## 4. Run a Strategy Tester pass from the command line
+Steps: copy the `.ex5` into the terminal's `MQL5\Experts`, write an ini file, start `terminal64.exe /config:<ini>`. The terminal runs the test and exits (`ShutdownTerminal=1`).
+Preconditions:
+- The terminal must NOT already be running with the same data dir. Check `Get-Process terminal64` first. If one is running, ask the user before closing it.
+- Use a unique EA file name (for example `audit_smoke_bot4.ex5`) so you never overwrite a deployed EA.
+```powershell
+$data = "$env:APPDATA\MetaQuotes\Terminal\<HASH>"
+Copy-Item "$repo\Experts\bot4_TREND_FX_v1_49.ex5" "$data\MQL5\Experts\audit_smoke_bot4.ex5" -Force
+$ini = "$env:TEMP\audit_smoke_bot4.ini"
+@"
+[Tester]
+Expert=audit_smoke_bot4
+Symbol=GOLD
+Period=M15
+Optimization=0
+Model=1
+FromDate=2026.01.05
+ToDate=2026.01.16
+ForwardMode=0
+Deposit=100000
+Currency=USD
+ProfitInPips=0
+Leverage=1:100
+ExecutionMode=0
+Visual=0
+ShutdownTerminal=1
+ReplaceReport=1
+Report=audit_smoke_bot4
+[TesterInputs]
+MagicNumber=40091||40091||1||40091||N
+UseGuardBarGate=false||false||0||true||N
+ShadowModeOnly=false||false||0||true||N
+DiagnosticMode=false||false||0||true||N
+LogAllCandidates=false||false||0||true||N
+LogRejected=false||false||0||true||N
+CsvHeartbeatSeconds=0||0||1||0||N
+"@ | Out-File -FilePath $ini -Encoding unicode      # UTF-16 is required
+Start-Process "C:\Program Files\BOSSAFX 5\terminal64.exe" -ArgumentList "/config:`"$ini`"" -PassThru
+```
+Key facts:
+- `Model`: 0 = every tick, 1 = 1-minute OHLC, 2 = open prices only, 4 = every tick based on real ticks. The verified run used 1.
+- `[TesterInputs]` line format is `Name=value||start||step||stop||N`. `N` means do not optimize. Use `Y` plus ranges for optimization with `Optimization=1`.
+- To use a `.set` file, copy it into `MQL5\Profiles\Tester\` and add `ExpertParameters=<file>.set` under `[Tester]`. **UNVERIFIED** in this repo. The `.set` files here contain `||` fields and comments and may carry a BOM; check them with `tests/check_config_sets.py` first. Do not use any set that the checker marks blocked (bot4 `DonchianExitPeriod=1` makes `OnInit` fail).
+- Default `ShadowModeOnly=true` in bot4. With it true the EA places no orders, so a backtest shows 0 trades. Override it in `[TesterInputs]` only for the test. Never change the source default.
+- Overriding `UseGuardBarGate=false` is deliberate: without a Guard EA running the gate fails open anyway, but the override removes ambiguity.
+- The terminal exits itself. If it is still running after the report appears, something is wrong.
+## 5. Read the result
+Poll until the process exits, then read:
+| Artifact | Path |
+| --- | --- |
+| Report | `<data dir>\audit_smoke_bot4.htm` plus `.png` charts beside it |
+| Tester journal | `<data dir>\Tester\logs\<yyyymmdd>.log` (UTF-16 LE) |
+| Agent log (same content) | `%APPDATA%\MetaQuotes\Tester\<HASH>\Agent-127.0.0.1-3000\logs\` |
+| EA file output (CSVs) | `%APPDATA%\MetaQuotes\Tester\<HASH>\Agent-127.0.0.1-3000\MQL5\Files\` (sandboxed per agent) |
+Quick extraction from the journal:
+- `final balance` line for the end balance.
+- `[INIT]` and `INIT FAILED` lines for startup state.
+- `[LIVE_DISPOSITION]` lines (bot4) for why a signal did or did not become an order.
+- `Test passed in` and `automatic testing finished` mean a clean finish.
+Report fields to quote: History Quality, Bars, Ticks, Total Net Profit, Total Trades, Profit Factor, Equity Drawdown Maximal, plus the exact inputs block.
+## 6. What the one verified run proved, and did not
+- Run: current `bot4_TREND_FX_v1_49.mq5` (0 errors, 0 warnings), GOLD M15, 2026.01.05 - 2026.01.16, 1-minute OHLC, 100,000 USD, history quality 100%, 0.45 s.
+- Result: initialized in LIVE mode, 0 trades, final balance 100,000.00. The D1 bias stayed neutral, so nothing reached the live score gate.
+- It proves: the toolchain works end to end (compile, tester launch, journal, report) and `OnInit` passes with those inputs.
+- It does not prove anything about profitability or entry/exit logic. 0 trades is not a pass of any strategy test.
+- The journal printed `Bot4 v1.45` while the file says 1.49 (init banner is stale).
+- A longer window with an active D1 breakout, or another EA, is needed to produce trades.
+## 7. Limits of the tester for this fleet
+- A tester pass runs one EA. Guard-to-EA coordination uses terminal `GlobalVariable`s (`MEG_<symbol>_BLOCK_NEW`, heartbeat, publish sequence). Tester GlobalVariables are isolated from the live terminal, and a second EA cannot run alongside in the same pass. Guard-gate rows of `docs/TEST_PLAN.md` therefore need either a small harness EA that sets those keys, or a demo-chart test with the Guard attached. **UNVERIFIED** which one the user prefers.
+- Guard and the gate require a hedging account. The tester inherits margin mode from the demo account. On a netting account the EAs must fail `OnInit` (that is an expected test outcome).
+- Tester fill, spread and slippage models are idealised; partial fills and TIMEOUT retcodes cannot be reproduced there. Those rows of `docs/TEST_PLAN.md` need a demo account.
+- The three semantic stage repairs (54325, 54326, 220202) need an A/B that this source cannot run on the historical files, because it rejects them. See `docs/TEST_PLAN.md`.
+## 8. Hand-off protocol if you cannot run Windows tooling
+Ask the human to run sections 3 and 4 and return exactly:
+1. The compiler log or the `COMPILE SUMMARY` line.
+2. `audit_smoke_bot4.htm` (or the equivalent per-run report) plus the matching journal file.
+3. The exact ini file used.
+4. The output of `python tests/check_guard_safety.py` and `python tests/check_config_sets.py`.
+Then analyse the returned files. Do not claim a backtest was run if you only reasoned about the code.
+## 9. Files you may need that are NOT in the GitHub repo
+`tests/check_guard_safety.py` and `tests/check_config_sets.py` were deliberately excluded from the push (they exist only on the original machine). Without them, the Python checks in `docs/TEST_PLAN.md` cannot be run. Ask the user for them or skip those steps and say so.
+## 10. Safety rules
+- Do not attach any EA to a live chart or a funded account. Use the tester or a demo account.
+- Do not edit `VALIDATED_LIVE_CONFIGS\`. It is the pinned historical baseline.
+- Do not delete or overwrite files inside the terminal data dir other than your own uniquely named `audit_*` files.
+- Do not store broker credentials in the repo or in logs.
+- Do not change source defaults to make a test pass. Override through `[TesterInputs]` only.
